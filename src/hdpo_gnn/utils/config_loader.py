@@ -3,7 +3,9 @@
 Utility functions for loading and merging configuration files.
 """
 from typing import Any, Dict
+
 import yaml
+
 
 def _deep_merge_dicts(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
     """
@@ -19,12 +21,13 @@ def _deep_merge_dicts(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[st
             result[key] = override_value
     return result
 
+
 def _load_yaml(path: str) -> Dict[str, Any]:
     """
     Loads a YAML file and returns a mapping.
     """
     try:
-        with open(path, 'r', encoding='utf-8') as f:
+        with open(path, "r", encoding="utf-8") as f:
             data = yaml.safe_load(f)
     except yaml.YAMLError as e:
         raise ValueError(f"Invalid YAML in {path}") from e
@@ -33,6 +36,7 @@ def _load_yaml(path: str) -> Dict[str, Any]:
     if not isinstance(data, dict):
         raise ValueError(f"YAML root must be a mapping in {path}")
     return data
+
 
 def load_configs(setting_path: str, hyperparams_path: str) -> Dict[str, Any]:
     """

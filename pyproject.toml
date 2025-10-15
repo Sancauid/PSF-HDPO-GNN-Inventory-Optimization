@@ -4,3 +4,13 @@ version = "0.1.0"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+# --- CONFIGURACIÓN DE BLACK ---
+[tool.black]
+line-length = 88
+target-version = ['py310']
+
+# --- CONFIGURACIÓN DE ISORT ---
+[tool.isort]
+profile = "black"
+line_length = 88

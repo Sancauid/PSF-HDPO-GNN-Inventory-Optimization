@@ -35,7 +35,7 @@ Contains all `.yml` configuration files. Experiments are defined by combining a 
 
 - **`data/datasets.py`:**
   - `create_synthetic_data_dict()`: Generates a dictionary of raw PyTorch tensors representing a batch of simulation scenarios (demands, initial inventories, costs). This is the source of truth for our synthetic experiments.
-  - `create_pyg_dataset()`: (To be implemented) Will convert the raw data dictionary into a list of `torch_geometric.data.Data` objects for GNN training.
+  - `create_pyg_dataset()`: Converts the synthetic data dictionary into a list of `torch_geometric.data.Data` graphs for PyG-based models (fully connected store graph per sample, with node features and per-sample attributes such as demands and costs).
 
 - **`engine/simulator.py`:**
   - `DifferentiableSimulator`: A class-based, differentiable simulator built from first principles in PyTorch. It contains two main methods:
@@ -109,3 +109,13 @@ Launch a training run from the root directory.
 # Example: Train the Vanilla MLP model for 20 epochs
 python train.py configs/settings/base_setting.yml configs/hyperparams/vanilla.yml --model vanilla --epochs 20
 ```
+
+## 5. Development & Quality Assurance
+
+Use the included helper script to run formatting and tests locally before committing changes.
+
+```bash
+./run_quality_checks.sh
+```
+
+This script is intended to enforce code style and verify unit tests pass, helping maintain a consistently healthy codebase.

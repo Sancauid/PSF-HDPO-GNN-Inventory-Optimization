@@ -1,165 +1,215 @@
 from typing import Any, Dict, Iterable, Optional, Tuple
+
 import torch
 from torch import nn
-from torch.optim import Optimizer
 from torch.nn.utils import clip_grad_norm_
+from torch.optim import Optimizer
 from tqdm.auto import tqdm
 
 
 class Trainer:
-  """
-  Encapsulates the end-to-end training loop with a differentiable simulator.
-
-  This class orchestrates epoch and batch loops, resets the simulator for each
-  batch, rolls out multi-period episodes, computes losses, performs backprop,
-  and steps the optimizer and scheduler.
-  """
-
-  def __init__(
-    self,
-    model: nn.Module,
-    optimizer: Optimizer,
-    scheduler: Optional[Any],
-    simulator: Any,
-    train_loader: Iterable[Dict[str, Any]],
-    configs: Dict[str, Any],
-  ) -> None:
     """
-    Initialize the Trainer.
+    Encapsulates the end-to-end training loop with a differentiable simulator.
 
-    Args:
-      model: Policy network.
-      optimizer: Optimizer instance.
-      scheduler: Optional LR scheduler.
-      simulator: Differentiable simulator with reset/step APIs.
-      train_loader: Iterable yielding batch dictionaries.
-      configs: Configuration mapping for problem, data, and training params.
+    This class orchestrates epoch and batch loops, resets the simulator for each
+    batch, rolls out multi-period episodes, computes losses, performs backprop,
+    and steps the optimizer and scheduler.
     """
-    self.model = model
-    self.optimizer = optimizer
-    self.scheduler = scheduler
-    self.simulator = simulator
-    self.train_loader = train_loader
-    self.configs = configs
 
-    self.problem_params = configs.get("problem_params", {})
-    self.data_params = configs.get("data_params", {})
-    self.training_params = configs.get("training_params", {})
-    self.architecture = (
-      configs.get("model_params", {}).get("architecture", "vanilla").lower()
-    )
+    def __init__(
+        self,
+        model: nn.Module,
+        optimizer: Optimizer,
+        scheduler: Optional[Any],
+        simulator: Any,
+        train_loader: Iterable[Dict[str, Any]],
+        configs: Dict[str, Any],
+    ) -> None:
+        """
+        Initialize the Trainer.
 
-  def train(self, epochs: int | None = None) -> None:
-    """
-    Run the main training loop over epochs.
-    """
-    num_epochs: int = int(epochs) if epochs is not None else int(self.training_params.get("epochs", 1))
-    for epoch in range(num_epochs):
-      avg_loss = self._train_epoch(epoch)
-      if self.scheduler is not None:
-        # Support ReduceLROnPlateau-style schedulers
-        try:
-          self.scheduler.step(avg_loss)
-        except TypeError:
-          self.scheduler.step()
-      print(f"epoch={epoch} avg_loss={avg_loss:.6f}")
+        Args:
+          model: Policy network.
+          optimizer: Optimizer instance.
+          scheduler: Optional LR scheduler.
+          simulator: Differentiable simulator with reset/step APIs.
+          train_loader: Iterable yielding batch dictionaries.
+          configs: Configuration mapping for problem, data, and training params.
+        """
+        self.model = model
+        self.optimizer = optimizer
+        self.scheduler = scheduler
+        self.simulator = simulator
+        self.train_loader = train_loader
+        self.configs = configs
 
-  def _train_epoch(self, epoch: int) -> float:
-    """
-    Train for a single epoch over all batches.
+        self.problem_params = configs.get("problem_params", {})
+        self.data_params = configs.get("data_params", {})
+        self.training_params = configs.get("training_params", {})
+        self.architecture = (
+            configs.get("model_params", {}).get("architecture", "vanilla").lower()
+        )
 
-    Args:
-      epoch: Current epoch index (0-based).
+    def train(self, epochs: int | None = None) -> None:
+        """
+        Run the main training loop over epochs.
+        """
+        num_epochs: int = (
+            int(epochs)
+            if epochs is not None
+            else int(self.training_params.get("epochs", 1))
+        )
+        for epoch in range(num_epochs):
+            avg_loss = self._train_epoch(epoch)
+            if self.scheduler is not None:
+                # Support ReduceLROnPlateau-style schedulers
+                try:
+                    self.scheduler.step(avg_loss)
+                except TypeError:
+                    self.scheduler.step()
+            print(f"epoch={epoch} avg_loss={avg_loss:.6f}")
 
-    Returns:
-      Average reported loss across all batches.
-    """
-    losses: list[float] = []
-    for batch in tqdm(self.train_loader, desc=f"train epoch {epoch}"):
-        batch_loss = self._train_batch(batch)
-        losses.append(batch_loss)
-    return float(sum(losses) / max(len(losses), 1))
+    def _train_epoch(self, epoch: int) -> float:
+        """
+        Train for a single epoch over all batches.
 
-  def _train_batch(self, batch: Dict[str, Any]) -> float:
-    """
-    Train on a single batch by running a full simulated episode.
+        Args:
+          epoch: Current epoch index (0-based).
 
-    Args:
-      batch: Dictionary containing tensors for resetting the simulator and any
-        additional inputs required by the model.
+        Returns:
+          Average reported loss across all batches.
+        """
+        losses: list[float] = []
+        for batch in tqdm(self.train_loader, desc=f"train epoch {epoch}"):
+            batch_loss = self._train_batch(batch)
+            losses.append(batch_loss)
+        return float(sum(losses) / max(len(losses), 1))
 
-    Returns:
-      A scalar float with the loss value reported for logging.
-    """
-    self.optimizer.zero_grad(set_to_none=True)
+    def _train_batch(self, batch: Dict[str, Any]) -> float:
+        """
+        Train on a single batch by running a full simulated episode.
 
-    inventories = batch.get("inventories")
-    demands = batch.get("demands")
-    cost_params = batch.get("cost_params")
-    lead_times = batch.get("lead_times")
+        Args:
+          batch: Dictionary containing tensors for resetting the simulator and any
+            additional inputs required by the model.
 
-    if inventories is None or demands is None or cost_params is None or lead_times is None:
-      raise ValueError("Batch missing required keys: inventories, demands, cost_params, lead_times")
+        Returns:
+          A scalar float with the loss value reported for logging.
+        """
+        self.optimizer.zero_grad(set_to_none=True)
 
-    periods: int = int(self.problem_params.get("periods", demands.shape[0]))
-    batch_size: int = int(self.data_params.get("n_samples", demands.shape[1]))
-    num_stores: int = int(self.problem_params.get("n_stores", inventories["stores"].shape[1]))
-    num_warehouses: int = int(self.problem_params.get("n_warehouses", inventories["warehouses"].shape[1]))
+        inventories = batch.get("inventories")
+        demands = batch.get("demands")
+        cost_params = batch.get("cost_params")
+        lead_times = batch.get("lead_times")
 
-    store_mask = torch.ones(num_stores, dtype=torch.bool, device=demands.device)
+        if (
+            inventories is None
+            or demands is None
+            or cost_params is None
+            or lead_times is None
+        ):
+            raise ValueError(
+                "Batch missing required keys: inventories, demands, cost_params, lead_times"
+            )
 
-    total_episode_cost = torch.zeros(batch_size, device=demands.device, dtype=demands.dtype)
+        periods: int = int(self.problem_params.get("periods", demands.shape[0]))
+        batch_size: int = int(self.data_params.get("n_samples", demands.shape[1]))
+        num_stores: int = int(
+            self.problem_params.get("n_stores", inventories["stores"].shape[1])
+        )
+        num_warehouses: int = int(
+            self.problem_params.get("n_warehouses", inventories["warehouses"].shape[1])
+        )
 
-    self.simulator.reset(
-      inventories=inventories,
-      demands=demands,
-      cost_params=cost_params,
-      lead_times=lead_times,
-    )
+        store_mask = torch.ones(num_stores, dtype=torch.bool, device=demands.device)
 
-    for t in range(periods):
-      if self.architecture == "vanilla":
-        obs = {
-          "inventory_stores": self.simulator.inventory_stores,
-          "inventory_warehouses": self.simulator.inventory_warehouses,
-        }
-        x = torch.cat([obs["inventory_stores"], obs["inventory_warehouses"]], dim=1)
-        outputs = self.model(x)
-        actions_stores = torch.sigmoid(outputs["stores"])  # [B, num_stores]
-        actions_wh = torch.sigmoid(outputs["warehouses"])  # [B, 1]
-        if actions_wh.shape[1] == 1 and num_warehouses > 1:
-          actions_wh = actions_wh.expand(-1, num_warehouses)
-      else:
-        if not {"x", "edge_index"}.issubset(set(batch.keys())):
-          actions_stores = torch.zeros(batch_size, num_stores, device=demands.device, dtype=demands.dtype)
-          actions_wh = torch.zeros(batch_size, num_warehouses, device=demands.device, dtype=demands.dtype)
-        else:
-          node_dict = self.model(batch["x"], batch["edge_index"])  # {'stores': [num_nodes, out]}
-          node_out = node_dict["stores"]  # [num_nodes, output_size]
-          total_nodes_per_sample = num_stores + num_warehouses
-          if node_out.dim() == 2 and node_out.size(1) == 1 and node_out.size(0) == batch_size * total_nodes_per_sample:
-            node_out = node_out.view(batch_size, total_nodes_per_sample, 1)
-            actions_stores = torch.nn.functional.softplus(node_out[:, :num_stores, 0])
-            actions_wh = torch.nn.functional.softplus(node_out[:, num_stores:, 0])
-          else:
-            actions_stores = torch.zeros(batch_size, num_stores, device=demands.device, dtype=demands.dtype)
-            actions_wh = torch.zeros(batch_size, num_warehouses, device=demands.device, dtype=demands.dtype)
+        total_episode_cost = torch.zeros(
+            batch_size, device=demands.device, dtype=demands.dtype
+        )
 
-      _, step_cost = self.simulator.step({
-        "stores": actions_stores,
-        "warehouses": actions_wh,
-      })
+        self.simulator.reset(
+            inventories=inventories,
+            demands=demands,
+            cost_params=cost_params,
+            lead_times=lead_times,
+        )
 
-      total_episode_cost = total_episode_cost + step_cost
+        for t in range(periods):
+            if self.architecture == "vanilla":
+                obs = {
+                    "inventory_stores": self.simulator.inventory_stores,
+                    "inventory_warehouses": self.simulator.inventory_warehouses,
+                }
+                x = torch.cat(
+                    [obs["inventory_stores"], obs["inventory_warehouses"]], dim=1
+                )
+                outputs = self.model(x)
+                actions_stores = torch.sigmoid(outputs["stores"])  # [B, num_stores]
+                actions_wh = torch.sigmoid(outputs["warehouses"])  # [B, 1]
+                if actions_wh.shape[1] == 1 and num_warehouses > 1:
+                    actions_wh = actions_wh.expand(-1, num_warehouses)
+            else:
+                if not {"x", "edge_index"}.issubset(set(batch.keys())):
+                    actions_stores = torch.zeros(
+                        batch_size,
+                        num_stores,
+                        device=demands.device,
+                        dtype=demands.dtype,
+                    )
+                    actions_wh = torch.zeros(
+                        batch_size,
+                        num_warehouses,
+                        device=demands.device,
+                        dtype=demands.dtype,
+                    )
+                else:
+                    node_dict = self.model(
+                        batch["x"], batch["edge_index"]
+                    )  # {'stores': [num_nodes, out]}
+                    node_out = node_dict["stores"]  # [num_nodes, output_size]
+                    total_nodes_per_sample = num_stores + num_warehouses
+                    if (
+                        node_out.dim() == 2
+                        and node_out.size(1) == 1
+                        and node_out.size(0) == batch_size * total_nodes_per_sample
+                    ):
+                        node_out = node_out.view(batch_size, total_nodes_per_sample, 1)
+                        actions_stores = torch.nn.functional.softplus(
+                            node_out[:, :num_stores, 0]
+                        )
+                        actions_wh = torch.nn.functional.softplus(
+                            node_out[:, num_stores:, 0]
+                        )
+                    else:
+                        actions_stores = torch.zeros(
+                            batch_size,
+                            num_stores,
+                            device=demands.device,
+                            dtype=demands.dtype,
+                        )
+                        actions_wh = torch.zeros(
+                            batch_size,
+                            num_warehouses,
+                            device=demands.device,
+                            dtype=demands.dtype,
+                        )
 
-    loss_for_backward = total_episode_cost.mean()
-    loss_to_report = loss_for_backward.detach()
+            _, step_cost = self.simulator.step(
+                {
+                    "stores": actions_stores,
+                    "warehouses": actions_wh,
+                }
+            )
 
-    loss_for_backward.backward()
-    max_norm = float(self.training_params.get("grad_clip_norm", 1.0))
-    clip_grad_norm_(self.model.parameters(), max_norm=max_norm)
-    self.optimizer.step()
+            total_episode_cost = total_episode_cost + step_cost
 
-    return float(loss_to_report.item())
+        loss_for_backward = total_episode_cost.mean()
+        loss_to_report = loss_for_backward.detach()
 
+        loss_for_backward.backward()
+        max_norm = float(self.training_params.get("grad_clip_norm", 1.0))
+        clip_grad_norm_(self.model.parameters(), max_norm=max_norm)
+        self.optimizer.step()
 
+        return float(loss_to_report.item())
