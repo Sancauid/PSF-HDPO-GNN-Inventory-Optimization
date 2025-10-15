@@ -1,0 +1,10 @@
+problem_params:
+  n_stores: 3
+  n_warehouses: 1
+  periods: 50
+  ignore_periods: 30
+data_params:
+  n_samples: 1024
+  batch_size: 256
+
+
