@@ -6,10 +6,13 @@ from typing import Dict, Any
 import argparse
 import pprint
 import torch
+from torch.utils.data import TensorDataset, DataLoader
 
 from src.hdpo_gnn.utils.config_loader import load_configs
 from src.hdpo_gnn.data.datasets import create_synthetic_data_dict
 from src.hdpo_gnn.engine.simulator import DifferentiableSimulator
+from src.hdpo_gnn.models import VanillaPolicy, GNNPolicy
+from src.hdpo_gnn.training.trainer import Trainer
 
 def main() -> None:
     """
@@ -19,6 +22,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Train an HDPO policy network.")
     parser.add_argument("setting_file", help="Path to the settings config file.")
     parser.add_argument("hyperparams_file", help="Path to the hyperparams config file.")
+    parser.add_argument("--model", choices=["vanilla", "gnn"], default=None, help="Model architecture override (defaults to config)")
+    parser.add_argument("--epochs", type=int, default=50, help="Number of training epochs.")
     args = parser.parse_args()
 
     config: Dict[str, Any] = load_configs(args.setting_file, args.hyperparams_file)
@@ -30,34 +35,40 @@ def main() -> None:
     print(f"inventories['stores'].shape = {tuple(inv['stores'].shape)}")
     print(f"inventories['warehouses'].shape = {tuple(inv['warehouses'].shape)}")
     print(f"demands.shape = {tuple(data['demands'].shape)}")
-    cp = data["cost_params"]
-    print(f"cost_params.holding_store.shape = {tuple(cp['holding_store'].shape)}")
-    print(f"cost_params.underage_store.shape = {tuple(cp['underage_store'].shape)}")
-    print(f"cost_params.holding_warehouse.shape = {tuple(cp['holding_warehouse'].shape)}")
+
+    # Build a minimal dataset/dataloader for training loop
+    batch = {
+        "inventories": inv,
+        "demands": data["demands"],
+        "cost_params": data["cost_params"],
+        "lead_times": data["lead_times"],
+    }
+    # Wrap in a list to form an iterable of one batch
+    train_loader = [batch]
+
+    arch = (args.model or config.get("model_params", {}).get("architecture", "vanilla")).lower()
+    if arch == "vanilla":
+        input_size = int(config["problem_params"]["n_stores"]) + int(config["problem_params"]["n_warehouses"])
+        output_size = int(config["problem_params"]["n_stores"]) + 1
+        model = VanillaPolicy(input_size=input_size, output_size=output_size)
+    else:
+        node_feature_size = 8
+        output_size = 1
+        model = GNNPolicy(node_feature_size=node_feature_size, output_size=output_size)
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=float(config.get("optimizer_params", {}).get("learning_rate", 3e-4)))
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=5)
 
     simulator = DifferentiableSimulator()
-    observation = simulator.reset(
-        inventories=data["inventories"],
-        demands=data["demands"],
-        cost_params=data["cost_params"],
-        lead_times=data["lead_times"],
+    trainer = Trainer(
+        model=model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        simulator=simulator,
+        train_loader=train_loader,
+        configs=config,
     )
-
-    periods: int = int(config["problem_params"]["periods"])
-    batch_size: int = int(config["data_params"]["n_samples"])
-    n_stores: int = int(config["problem_params"]["n_stores"])
-    n_warehouses: int = int(config["problem_params"]["n_warehouses"]) 
-
-    for t in range(periods):
-        actions = {
-        "stores": torch.zeros(batch_size, n_stores),
-        "warehouses": torch.zeros(batch_size, n_warehouses),
-        }
-        new_observation, cost = simulator.step(actions)
-        print(f"t={t}, Cost shape: {cost.shape}, Avg cost: {cost.mean().item():.4f}")
-        observation = new_observation
-
-    print("\nEpisode simulation completed successfully.")
+    trainer.train(epochs=args.epochs)
 
 if __name__ == '__main__':
     main()

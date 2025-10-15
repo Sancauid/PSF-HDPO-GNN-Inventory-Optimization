@@ -49,15 +49,19 @@ class Trainer:
       configs.get("model_params", {}).get("architecture", "vanilla").lower()
     )
 
-  def train(self) -> None:
+  def train(self, epochs: int | None = None) -> None:
     """
     Run the main training loop over epochs.
     """
-    epochs: int = int(self.training_params.get("epochs", 1))
-    for epoch in range(epochs):
+    num_epochs: int = int(epochs) if epochs is not None else int(self.training_params.get("epochs", 1))
+    for epoch in range(num_epochs):
       avg_loss = self._train_epoch(epoch)
       if self.scheduler is not None:
-        self.scheduler.step()
+        # Support ReduceLROnPlateau-style schedulers
+        try:
+          self.scheduler.step(avg_loss)
+        except TypeError:
+          self.scheduler.step()
       print(f"epoch={epoch} avg_loss={avg_loss:.6f}")
 
   def _train_epoch(self, epoch: int) -> float:
@@ -120,17 +124,18 @@ class Trainer:
           "inventory_warehouses": self.simulator.inventory_warehouses,
         }
         x = torch.cat([obs["inventory_stores"], obs["inventory_warehouses"]], dim=1)
-        logits = self.model(x)
-        store_logits = logits[:, :num_stores]
-        wh_logits = logits[:, -num_warehouses:]
-        actions_stores = torch.sigmoid(store_logits)
-        actions_wh = torch.sigmoid(wh_logits)
+        outputs = self.model(x)
+        actions_stores = torch.sigmoid(outputs["stores"])  # [B, num_stores]
+        actions_wh = torch.sigmoid(outputs["warehouses"])  # [B, 1]
+        if actions_wh.shape[1] == 1 and num_warehouses > 1:
+          actions_wh = actions_wh.expand(-1, num_warehouses)
       else:
         if not {"x", "edge_index"}.issubset(set(batch.keys())):
           actions_stores = torch.zeros(batch_size, num_stores, device=demands.device, dtype=demands.dtype)
           actions_wh = torch.zeros(batch_size, num_warehouses, device=demands.device, dtype=demands.dtype)
         else:
-          node_out = self.model(batch["x"], batch["edge_index"])  # [num_nodes, 1]
+          node_dict = self.model(batch["x"], batch["edge_index"])  # {'stores': [num_nodes, out]}
+          node_out = node_dict["stores"]  # [num_nodes, output_size]
           total_nodes_per_sample = num_stores + num_warehouses
           if node_out.dim() == 2 and node_out.size(1) == 1 and node_out.size(0) == batch_size * total_nodes_per_sample:
             node_out = node_out.view(batch_size, total_nodes_per_sample, 1)
