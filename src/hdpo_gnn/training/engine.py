@@ -6,6 +6,8 @@ from torch.nn.utils import clip_grad_norm_
 from torch_geometric.data import Batch
 from torch_geometric.utils import to_dense_batch
 
+from hdpo_gnn.engine.functional import transition_step
+
 
 def prepare_batch_for_simulation(
     batch: Any, architecture: str, device: torch.device
@@ -67,13 +69,13 @@ def prepare_batch_for_simulation(
     cost_params = {
         "holding_store": torch.as_tensor(
             getattr(batch, "holding_store", 1.0), device=device, dtype=dtype
-        ),
+        ).flatten()[0],
         "underage_store": torch.as_tensor(
             getattr(batch, "underage_store", 1.0), device=device, dtype=dtype
-        ),
+        ).flatten()[0],
         "holding_warehouse": torch.as_tensor(
             getattr(batch, "holding_warehouse", 0.5), device=device, dtype=dtype
-        ),
+        ).flatten()[0],
     }
     lead_times = {
         "stores": int(
@@ -101,7 +103,7 @@ def prepare_batch_for_simulation(
 
 def run_simulation_episode(
     model: nn.Module,
-    simulator: Any,
+    simulator: Any = None,
     batch: Any | None = None,
     periods: int = 1,
     ignore_periods: int = 0,
@@ -110,7 +112,7 @@ def run_simulation_episode(
     architecture: str = "vanilla",
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Roll out one full simulation episode and accumulate costs.
+    Roll out one full simulation episode and accumulate costs using functional transition_step.
 
     Returns total cost and cost-to-report vectors (shape [B]).
     """
@@ -119,17 +121,9 @@ def run_simulation_episode(
     cost_params = data_for_reset["cost_params"]
     lead_times = data_for_reset["lead_times"]
     current_state = {
-        "inventory_stores": inventories["stores"],
-        "inventory_warehouses": inventories["warehouses"],
+        "inventory_stores": inventories["stores"].clone(),
+        "inventory_warehouses": inventories["warehouses"].clone(),
     }
-
-    # Always reset the provided simulator to align its internal state
-    simulator.reset(
-        inventories=inventories,
-        demands=demands,
-        cost_params=cost_params,
-        lead_times=lead_times,
-    )
 
     if architecture == "vanilla":
         B = demands.shape[1]
@@ -147,15 +141,20 @@ def run_simulation_episode(
             outputs = model(x)
             actions_stores = torch.sigmoid(outputs["stores"])
             actions_wh = torch.sigmoid(outputs["warehouses"])
-            # apply store mask if provided
             if store_mask is not None:
                 actions_stores = actions_stores * store_mask.view(1, -1).to(
                     actions_stores.device, actions_stores.dtype
                 )
             if actions_wh.shape[1] == 1 and num_warehouses > 1:
                 actions_wh = actions_wh.expand(-1, num_warehouses)
-            next_state, step_cost = simulator.step(
-                {"stores": actions_stores, "warehouses": actions_wh}
+
+            demand_t = demands[t]
+            next_state, step_cost = transition_step(
+                current_state=current_state,
+                action={"stores": actions_stores, "warehouses": actions_wh},
+                demand_t=demand_t,
+                cost_params=cost_params,
+                lead_times=lead_times,
             )
             current_state = next_state
             total_episode_cost = total_episode_cost + step_cost
@@ -164,9 +163,8 @@ def run_simulation_episode(
         cost_to_report = (
             sum(step_costs[-effective:]) if step_costs else total_episode_cost
         )
-        return total_episode_cost, cost_to_report.detach()
+        return total_episode_cost, cost_to_report
 
-    # GNN
     pyg_batch: Batch = data_for_reset["pyg_batch"]
     B, N = int(data_for_reset["B"]), int(data_for_reset["N"])
     dtype, device = demands.dtype, demands.device
@@ -174,7 +172,7 @@ def run_simulation_episode(
     total_episode_cost = torch.zeros(B, device=device, dtype=dtype)
     step_costs: list[torch.Tensor] = []
     for t in range(periods):
-        current_store_inv = current_state["inventory_stores"]  # [B,N]
+        current_store_inv = current_state["inventory_stores"]
         current_batch_x = current_store_inv.view(B * N, -1)
         current_batch = Batch(
             x=current_batch_x, edge_index=pyg_batch.edge_index, batch=pyg_batch.batch
@@ -186,16 +184,25 @@ def run_simulation_episode(
             actions_stores = actions_stores * store_mask.view(1, -1).to(
                 actions_stores.device, actions_stores.dtype
             )
-        actions_wh = torch.zeros(B, num_warehouses, device=device, dtype=dtype)
-        next_state, step_cost = simulator.step(
-            {"stores": actions_stores, "warehouses": actions_wh}
+        # For GNN models, compute warehouse actions based on store actions
+        # This is a simple heuristic: warehouse actions = sum of store actions / num_warehouses
+        total_store_actions = actions_stores.sum(dim=1, keepdim=True)
+        actions_wh = total_store_actions / num_warehouses
+
+        demand_t = demands[t]
+        next_state, step_cost = transition_step(
+            current_state=current_state,
+            action={"stores": actions_stores, "warehouses": actions_wh},
+            demand_t=demand_t,
+            cost_params=cost_params,
+            lead_times=lead_times,
         )
         current_state = next_state
         total_episode_cost = total_episode_cost + step_cost
         step_costs.append(step_cost)
     effective = max(int(periods) - int(ignore_periods), 1)
     cost_to_report = sum(step_costs[-effective:]) if step_costs else total_episode_cost
-    return total_episode_cost, cost_to_report.detach()
+    return total_episode_cost, cost_to_report
 
 
 def calculate_losses(

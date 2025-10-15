@@ -129,20 +129,29 @@ class Trainer:
             assert isinstance(batch, Batch)
             data_for_reset, store_mask = self._prepare_gnn_batch(batch)
 
-        total_episode_cost, cost_to_report = self._run_simulation_episode(
-            data_for_reset, store_mask
-        )
-
         periods = int(
             self.problem_params.get("periods", data_for_reset["demands"].shape[0])
         )
         ignore_periods = int(self.problem_params.get("ignore_periods", 0))
         num_real_stores = int(self.problem_params.get("n_stores", store_mask.numel()))
 
-        loss_for_backward, loss_to_report_tensor = self._calculate_losses(
+        total_episode_cost, cost_to_report = run_simulation_episode(
+            model=self.model,
+            simulator=None,
+            batch=(
+                data_for_reset.get("pyg_batch") if self.architecture == "gnn" else None
+            ),
+            periods=periods,
+            ignore_periods=ignore_periods,
+            data_for_reset=data_for_reset,
+            store_mask=store_mask,
+            architecture=self.architecture,
+        )
+
+        loss_for_backward, loss_to_report_tensor = calculate_losses(
             total_episode_cost=total_episode_cost,
             cost_to_report=cost_to_report,
-            num_real_stores=num_real_stores,
+            total_real_stores=num_real_stores,
             periods=periods,
             ignore_periods=ignore_periods,
         )
@@ -199,13 +208,13 @@ class Trainer:
         cost_params = {
             "holding_store": torch.as_tensor(
                 getattr(batch, "holding_store", 1.0), device=device, dtype=dtype
-            ),
+            ).flatten()[0],
             "underage_store": torch.as_tensor(
                 getattr(batch, "underage_store", 1.0), device=device, dtype=dtype
-            ),
+            ).flatten()[0],
             "holding_warehouse": torch.as_tensor(
                 getattr(batch, "holding_warehouse", 0.5), device=device, dtype=dtype
-            ),
+            ).flatten()[0],
         }
         lead_times = {
             "stores": int(
@@ -232,82 +241,3 @@ class Trainer:
             "N": N,
         }
         return data_for_reset, store_mask
-
-    def _run_simulation_episode(
-        self, data_for_reset: Dict[str, Any], store_mask: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Run a full multi-period simulation, producing accumulated costs.
-
-        Args:
-            data_for_reset: Mapping prepared for simulator.reset plus any extra context.
-            store_mask: Boolean mask over stores (reserved for future filtering).
-
-        Returns:
-            A tuple (total_episode_cost, cost_to_report), both shaped [B].
-        """
-        inventories = data_for_reset["inventories"]
-        demands = data_for_reset["demands"]
-        cost_params = data_for_reset["cost_params"]
-        lead_times = data_for_reset["lead_times"]
-
-        from .engine import run_simulation_episode
-
-        periods: int = int(self.problem_params.get("periods", demands.shape[0]))
-        if self.architecture == "vanilla":
-            total_episode_cost, cost_to_report = run_simulation_episode(
-                model=self.model,
-                simulator=self.simulator,
-                batch=None,
-                periods=periods,
-                ignore_periods=int(self.problem_params.get("ignore_periods", 0)),
-                data_for_reset={
-                    "inventories": inventories,
-                    "demands": demands,
-                    "cost_params": cost_params,
-                    "lead_times": lead_times,
-                },
-                store_mask=store_mask,
-                architecture="vanilla",
-            )
-            return total_episode_cost, cost_to_report
-        else:
-            total_episode_cost, cost_to_report = run_simulation_episode(
-                model=self.model,
-                simulator=self.simulator,
-                batch=data_for_reset.get("pyg_batch"),
-                periods=periods,
-                ignore_periods=int(self.problem_params.get("ignore_periods", 0)),
-                data_for_reset=data_for_reset,
-                store_mask=store_mask,
-                architecture="gnn",
-            )
-            return total_episode_cost, cost_to_report
-
-    def _calculate_losses(
-        self,
-        total_episode_cost: torch.Tensor,
-        cost_to_report: torch.Tensor,
-        num_real_stores: int,
-        periods: int,
-        ignore_periods: int,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Compute normalized losses for backward and reporting.
-
-        Args:
-            total_episode_cost: Sum of per-step costs per sample, shape [B].
-            cost_to_report: Same as total_episode_cost or a filtered version, shape [B].
-            num_real_stores: Number of real stores used for normalization.
-            periods: Total simulation periods.
-            ignore_periods: Periods to ignore when normalizing (e.g., warm-up).
-
-        Returns:
-            (loss_for_backward, loss_to_report), both scalar tensors.
-        """
-        effective_periods = max(int(periods) - int(ignore_periods), 1)
-        denom_bwd = max(num_real_stores * int(periods), 1)
-        denom_report = max(num_real_stores * effective_periods, 1)
-        loss_for_backward = total_episode_cost.mean() / float(denom_bwd)
-        loss_to_report = cost_to_report.mean() / float(denom_report)
-        return loss_for_backward, loss_to_report

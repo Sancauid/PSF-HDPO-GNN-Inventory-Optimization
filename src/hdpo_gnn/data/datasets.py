@@ -44,11 +44,18 @@ def create_synthetic_data_dict(config: Dict[str, Any]) -> Dict[str, Any]:
     device = torch.device("cpu")
     dtype = torch.float32
 
+    # Initialize with realistic starting inventories
+    # Stores start with some inventory to meet initial demand
+    store_inv_dist = torch.distributions.Exponential(
+        rate=torch.tensor(0.2, dtype=dtype, device=device)  # mean = 5
+    )
+    warehouse_inv_dist = torch.distributions.Exponential(
+        rate=torch.tensor(0.1, dtype=dtype, device=device)  # mean = 10
+    )
+
     inventories = {
-        "stores": torch.zeros(batch_size, num_stores, device=device, dtype=dtype),
-        "warehouses": torch.zeros(
-            batch_size, num_warehouses, device=device, dtype=dtype
-        ),
+        "stores": store_inv_dist.rsample((batch_size, num_stores)),
+        "warehouses": warehouse_inv_dist.rsample((batch_size, num_warehouses)),
     }
 
     normal = torch.distributions.Normal(
