@@ -1,5 +1,5 @@
 # tests/test_config_loader.py
-from src.hdpo_gnn.utils.config_loader import load_configs
+from hdpo_gnn.utils.config_loader import load_configs
 import os
 
 def test_load_configs_successfully(tmp_path):
