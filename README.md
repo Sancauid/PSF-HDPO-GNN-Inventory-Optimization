@@ -16,10 +16,11 @@ The foundational architecture of the project is now complete. The codebase is or
 *   **`src/hdpo_gnn/`**: The core Python package.
     *   `utils/config_loader.py`: A robust, tested utility for loading and merging configurations.
     *   `engine/simulator.py`: A `DifferentiableSimulator` class, built from first principles in PyTorch, forming the core of the HDPO engine.
+    *   `data/datasets.py`: Synthetic training data generation logic (config-driven tensors for inventories, demands, costs, and lead times).
 *   **`tests/`**: A suite of unit tests to ensure code correctness and prevent regressions.
 *   **`train.py`**: The main entry point and orchestrator for all training runs.
 
-**Current milestone: The core configuration loading and the simulator engine have been implemented and are passing all unit tests.**
+**Current milestone: The core data generation pipeline is implemented and tested. The system can now produce synthetic training data based on configuration files.**
 
 ## 3. How to Run
 
