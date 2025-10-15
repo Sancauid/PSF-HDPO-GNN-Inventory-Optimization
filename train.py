@@ -7,6 +7,7 @@ import argparse
 import pprint
 
 from src.hdpo_gnn.utils.config_loader import load_configs
+from src.hdpo_gnn.data.datasets import create_synthetic_data_dict
 
 def main() -> None:
     """
@@ -20,6 +21,17 @@ def main() -> None:
 
     config: Dict[str, Any] = load_configs(args.setting_file, args.hyperparams_file)
     pprint.pprint(config)
+
+    data = create_synthetic_data_dict(config)
+    print("\nSynthetic data generated successfully.")
+    inv = data["inventories"]
+    print(f"inventories['stores'].shape = {tuple(inv['stores'].shape)}")
+    print(f"inventories['warehouses'].shape = {tuple(inv['warehouses'].shape)}")
+    print(f"demands.shape = {tuple(data['demands'].shape)}")
+    cp = data["cost_params"]
+    print(f"cost_params.holding_store.shape = {tuple(cp['holding_store'].shape)}")
+    print(f"cost_params.underage_store.shape = {tuple(cp['underage_store'].shape)}")
+    print(f"cost_params.holding_warehouse.shape = {tuple(cp['holding_warehouse'].shape)}")
 
 if __name__ == '__main__':
     main()
