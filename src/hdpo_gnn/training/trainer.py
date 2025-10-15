@@ -4,7 +4,16 @@ import torch
 from torch import nn
 from torch.nn.utils import clip_grad_norm_
 from torch.optim import Optimizer
+from torch_geometric.data import Batch
+from torch_geometric.utils import to_dense_batch
 from tqdm.auto import tqdm
+
+from .engine import (
+    calculate_losses,
+    perform_gradient_step,
+    prepare_batch_for_simulation,
+    run_simulation_episode,
+)
 
 
 class Trainer:
@@ -21,7 +30,6 @@ class Trainer:
         model: nn.Module,
         optimizer: Optimizer,
         scheduler: Optional[Any],
-        simulator: Any,
         train_loader: Iterable[Dict[str, Any]],
         configs: Dict[str, Any],
     ) -> None:
@@ -39,7 +47,7 @@ class Trainer:
         self.model = model
         self.optimizer = optimizer
         self.scheduler = scheduler
-        self.simulator = simulator
+        self.simulator = None
         self.train_loader = train_loader
         self.configs = configs
 
@@ -85,131 +93,221 @@ class Trainer:
             losses.append(batch_loss)
         return float(sum(losses) / max(len(losses), 1))
 
-    def _train_batch(self, batch: Dict[str, Any]) -> float:
+    def _train_batch(self, batch: Dict[str, Any] | Batch) -> float:
         """
         Train on a single batch by running a full simulated episode.
 
         Args:
-          batch: Dictionary containing tensors for resetting the simulator and any
-            additional inputs required by the model.
+            batch: Dictionary containing tensors for resetting the simulator and any
+                additional inputs required by the model.
 
         Returns:
-          A scalar float with the loss value reported for logging.
+            A scalar float with the loss value reported for logging.
         """
         self.optimizer.zero_grad(set_to_none=True)
 
-        inventories = batch.get("inventories")
-        demands = batch.get("demands")
-        cost_params = batch.get("cost_params")
-        lead_times = batch.get("lead_times")
-
-        if (
-            inventories is None
-            or demands is None
-            or cost_params is None
-            or lead_times is None
-        ):
-            raise ValueError(
-                "Batch missing required keys: inventories, demands, cost_params, lead_times"
-            )
-
-        periods: int = int(self.problem_params.get("periods", demands.shape[0]))
-        batch_size: int = int(self.data_params.get("n_samples", demands.shape[1]))
-        num_stores: int = int(
-            self.problem_params.get("n_stores", inventories["stores"].shape[1])
-        )
-        num_warehouses: int = int(
-            self.problem_params.get("n_warehouses", inventories["warehouses"].shape[1])
-        )
-
-        store_mask = torch.ones(num_stores, dtype=torch.bool, device=demands.device)
-
-        total_episode_cost = torch.zeros(
-            batch_size, device=demands.device, dtype=demands.dtype
-        )
-
-        self.simulator.reset(
-            inventories=inventories,
-            demands=demands,
-            cost_params=cost_params,
-            lead_times=lead_times,
-        )
-
-        for t in range(periods):
-            if self.architecture == "vanilla":
-                obs = {
-                    "inventory_stores": self.simulator.inventory_stores,
-                    "inventory_warehouses": self.simulator.inventory_warehouses,
-                }
-                x = torch.cat(
-                    [obs["inventory_stores"], obs["inventory_warehouses"]], dim=1
+        # Prepare reset data and store mask depending on architecture
+        if self.architecture == "vanilla":
+            assert isinstance(batch, dict)
+            data_for_reset = {
+                "inventories": batch["inventories"],
+                "demands": batch["demands"],
+                "cost_params": batch["cost_params"],
+                "lead_times": batch["lead_times"],
+            }
+            num_stores = int(
+                self.problem_params.get(
+                    "n_stores", data_for_reset["inventories"]["stores"].shape[1]
                 )
-                outputs = self.model(x)
-                actions_stores = torch.sigmoid(outputs["stores"])  # [B, num_stores]
-                actions_wh = torch.sigmoid(outputs["warehouses"])  # [B, 1]
-                if actions_wh.shape[1] == 1 and num_warehouses > 1:
-                    actions_wh = actions_wh.expand(-1, num_warehouses)
-            else:
-                if not {"x", "edge_index"}.issubset(set(batch.keys())):
-                    actions_stores = torch.zeros(
-                        batch_size,
-                        num_stores,
-                        device=demands.device,
-                        dtype=demands.dtype,
-                    )
-                    actions_wh = torch.zeros(
-                        batch_size,
-                        num_warehouses,
-                        device=demands.device,
-                        dtype=demands.dtype,
-                    )
-                else:
-                    node_dict = self.model(
-                        batch["x"], batch["edge_index"]
-                    )  # {'stores': [num_nodes, out]}
-                    node_out = node_dict["stores"]  # [num_nodes, output_size]
-                    total_nodes_per_sample = num_stores + num_warehouses
-                    if (
-                        node_out.dim() == 2
-                        and node_out.size(1) == 1
-                        and node_out.size(0) == batch_size * total_nodes_per_sample
-                    ):
-                        node_out = node_out.view(batch_size, total_nodes_per_sample, 1)
-                        actions_stores = torch.nn.functional.softplus(
-                            node_out[:, :num_stores, 0]
-                        )
-                        actions_wh = torch.nn.functional.softplus(
-                            node_out[:, num_stores:, 0]
-                        )
-                    else:
-                        actions_stores = torch.zeros(
-                            batch_size,
-                            num_stores,
-                            device=demands.device,
-                            dtype=demands.dtype,
-                        )
-                        actions_wh = torch.zeros(
-                            batch_size,
-                            num_warehouses,
-                            device=demands.device,
-                            dtype=demands.dtype,
-                        )
-
-            _, step_cost = self.simulator.step(
-                {
-                    "stores": actions_stores,
-                    "warehouses": actions_wh,
-                }
             )
+            store_mask = torch.ones(
+                num_stores,
+                dtype=torch.bool,
+                device=data_for_reset["demands"].device,
+            )
+        else:
+            assert isinstance(batch, Batch)
+            data_for_reset, store_mask = self._prepare_gnn_batch(batch)
 
-            total_episode_cost = total_episode_cost + step_cost
+        total_episode_cost, cost_to_report = self._run_simulation_episode(
+            data_for_reset, store_mask
+        )
 
-        loss_for_backward = total_episode_cost.mean()
-        loss_to_report = loss_for_backward.detach()
+        periods = int(
+            self.problem_params.get("periods", data_for_reset["demands"].shape[0])
+        )
+        ignore_periods = int(self.problem_params.get("ignore_periods", 0))
+        num_real_stores = int(self.problem_params.get("n_stores", store_mask.numel()))
+
+        loss_for_backward, loss_to_report_tensor = self._calculate_losses(
+            total_episode_cost=total_episode_cost,
+            cost_to_report=cost_to_report,
+            num_real_stores=num_real_stores,
+            periods=periods,
+            ignore_periods=ignore_periods,
+        )
 
         loss_for_backward.backward()
         max_norm = float(self.training_params.get("grad_clip_norm", 1.0))
         clip_grad_norm_(self.model.parameters(), max_norm=max_norm)
         self.optimizer.step()
 
-        return float(loss_to_report.item())
+        return float(loss_to_report_tensor.item())
+
+    def _prepare_gnn_batch(self, batch: Batch) -> Tuple[Dict[str, Any], torch.Tensor]:
+        """
+        Prepare PyG batch into dense tensors for simulator.reset and create store mask.
+
+        Args:
+            batch: A PyG Batch containing graphs with attributes x, edge_index, batch,
+                and per-graph attributes like demands, costs, and lead times.
+
+        Returns:
+            A tuple (data_for_reset, store_mask) where data_for_reset is a mapping with
+            keys 'inventories', 'demands', 'cost_params', 'lead_times', plus references
+            to the original PyG batch and shape metadata to support the simulation loop.
+        """
+        dense_x, mask = to_dense_batch(batch.x, batch.batch)  # [B, N, F]
+        B, N = dense_x.size(0), dense_x.size(1)
+        device, dtype = dense_x.device, dense_x.dtype
+        periods: int = int(self.problem_params.get("periods"))
+
+        inventories = {
+            "stores": dense_x[..., 0],
+            "warehouses": torch.zeros(
+                B,
+                int(self.problem_params.get("n_warehouses", 1)),
+                device=device,
+                dtype=dtype,
+            ),
+        }
+
+        if hasattr(batch, "demands"):
+            d = batch.demands
+            if d.dim() == 3 and d.size(0) == B and d.size(2) == N:
+                demands = d.permute(1, 0, 2).to(device=device, dtype=dtype)  # [T,B,N]
+            elif d.dim() == 2 and d.size(1) == N:
+                T = periods
+                demands = (
+                    d.view(B, T, N).permute(1, 0, 2).to(device=device, dtype=dtype)
+                )
+            else:
+                raise ValueError("Unexpected demands shape in PyG batch")
+        else:
+            raise ValueError("PyG batch missing 'demands' attribute")
+
+        cost_params = {
+            "holding_store": torch.as_tensor(
+                getattr(batch, "holding_store", 1.0), device=device, dtype=dtype
+            ),
+            "underage_store": torch.as_tensor(
+                getattr(batch, "underage_store", 1.0), device=device, dtype=dtype
+            ),
+            "holding_warehouse": torch.as_tensor(
+                getattr(batch, "holding_warehouse", 0.5), device=device, dtype=dtype
+            ),
+        }
+        lead_times = {
+            "stores": int(
+                torch.as_tensor(getattr(batch, "lead_time_stores", 0))
+                .flatten()[0]
+                .item()
+            ),
+            "warehouses": int(
+                torch.as_tensor(getattr(batch, "lead_time_warehouses", 0))
+                .flatten()[0]
+                .item()
+            ),
+        }
+
+        store_mask = torch.ones(N, dtype=torch.bool, device=device)
+
+        data_for_reset: Dict[str, Any] = {
+            "inventories": inventories,
+            "demands": demands,
+            "cost_params": cost_params,
+            "lead_times": lead_times,
+            "pyg_batch": batch,
+            "B": B,
+            "N": N,
+        }
+        return data_for_reset, store_mask
+
+    def _run_simulation_episode(
+        self, data_for_reset: Dict[str, Any], store_mask: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Run a full multi-period simulation, producing accumulated costs.
+
+        Args:
+            data_for_reset: Mapping prepared for simulator.reset plus any extra context.
+            store_mask: Boolean mask over stores (reserved for future filtering).
+
+        Returns:
+            A tuple (total_episode_cost, cost_to_report), both shaped [B].
+        """
+        inventories = data_for_reset["inventories"]
+        demands = data_for_reset["demands"]
+        cost_params = data_for_reset["cost_params"]
+        lead_times = data_for_reset["lead_times"]
+
+        from .engine import run_simulation_episode
+
+        periods: int = int(self.problem_params.get("periods", demands.shape[0]))
+        if self.architecture == "vanilla":
+            total_episode_cost, cost_to_report = run_simulation_episode(
+                model=self.model,
+                simulator=self.simulator,
+                batch=None,
+                periods=periods,
+                ignore_periods=int(self.problem_params.get("ignore_periods", 0)),
+                data_for_reset={
+                    "inventories": inventories,
+                    "demands": demands,
+                    "cost_params": cost_params,
+                    "lead_times": lead_times,
+                },
+                store_mask=store_mask,
+                architecture="vanilla",
+            )
+            return total_episode_cost, cost_to_report
+        else:
+            total_episode_cost, cost_to_report = run_simulation_episode(
+                model=self.model,
+                simulator=self.simulator,
+                batch=data_for_reset.get("pyg_batch"),
+                periods=periods,
+                ignore_periods=int(self.problem_params.get("ignore_periods", 0)),
+                data_for_reset=data_for_reset,
+                store_mask=store_mask,
+                architecture="gnn",
+            )
+            return total_episode_cost, cost_to_report
+
+    def _calculate_losses(
+        self,
+        total_episode_cost: torch.Tensor,
+        cost_to_report: torch.Tensor,
+        num_real_stores: int,
+        periods: int,
+        ignore_periods: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Compute normalized losses for backward and reporting.
+
+        Args:
+            total_episode_cost: Sum of per-step costs per sample, shape [B].
+            cost_to_report: Same as total_episode_cost or a filtered version, shape [B].
+            num_real_stores: Number of real stores used for normalization.
+            periods: Total simulation periods.
+            ignore_periods: Periods to ignore when normalizing (e.g., warm-up).
+
+        Returns:
+            (loss_for_backward, loss_to_report), both scalar tensors.
+        """
+        effective_periods = max(int(periods) - int(ignore_periods), 1)
+        denom_bwd = max(num_real_stores * int(periods), 1)
+        denom_report = max(num_real_stores * effective_periods, 1)
+        loss_for_backward = total_episode_cost.mean() / float(denom_bwd)
+        loss_to_report = cost_to_report.mean() / float(denom_report)
+        return loss_for_backward, loss_to_report
