@@ -7,32 +7,42 @@ from torch_geometric.nn import GCNConv
 
 class GNNPolicy(nn.Module):
     """
-    A simple GCN-based policy producing per-node outputs.
+    An Edge GCN-based policy producing edge flow predictions.
 
-    Two layers of GCNConv with ReLU in between. The network takes node features
-    and an edge_index (COO) graph structure from PyG and returns updated node
-    embeddings. A final linear layer maps to per-node outputs of size 1.
+    This model uses GCN layers to create node embeddings, then processes edge features
+    (concatenated source and destination node embeddings) through an MLP to predict
+    flow values for each edge. The architecture consists of two GCN layers for node
+    representation learning, followed by an edge MLP for flow prediction.
     """
 
     def __init__(self, node_feature_size: int, output_size: int) -> None:
         """
-        Initialize the GNNPolicy.
+        Initialize the Edge GNNPolicy.
 
         Args:
           node_feature_size: Number of features per node.
-          output_size: Size of per-node outputs (usually 1).
+          output_size: Size of per-edge outputs (usually 1 for flow prediction).
         """
         super().__init__()
         hidden = 128
+        
+        # GCN layers for node embedding
         self.conv1 = GCNConv(node_feature_size, hidden)
         self.conv2 = GCNConv(hidden, hidden)
         self.act = nn.ReLU()
-        self.head = nn.Linear(hidden, output_size)
+        
+        # Edge MLP for flow prediction
+        self.edge_mlp = nn.Sequential(
+            nn.Linear(2 * hidden, hidden),  # Concatenated source + dest embeddings
+            nn.ReLU(),
+            nn.Linear(hidden, 1)  # Single flow value per edge
+        )
+        
         self.output_size = int(output_size)
 
     def forward(self, x: Tensor, edge_index: Tensor) -> dict[str, Tensor]:
         """
-        Compute forward pass on a (batched) PyG graph.
+        Compute forward pass to predict edge flows.
 
         Args:
           x: Node features of shape [num_nodes, node_feature_size]. If using a
@@ -41,11 +51,24 @@ class GNNPolicy(nn.Module):
 
         Returns:
           A dictionary with:
-            - 'stores': tensor of per-node outputs [num_nodes, output_size]
+            - 'flows': tensor of edge flow predictions [num_edges, 1]
         """
-        x = self.conv1(x, edge_index)
-        x = self.act(x)
-        x = self.conv2(x, edge_index)
-        x = self.act(x)
-        out = self.head(x)
-        return {"stores": out}
+        # Create node embeddings through GCN layers
+        node_embeddings = self.conv1(x, edge_index)
+        node_embeddings = self.act(node_embeddings)
+        node_embeddings = self.conv2(node_embeddings, edge_index)
+        node_embeddings = self.act(node_embeddings)
+        
+        # Extract source and destination nodes from edge_index
+        row, col = edge_index[0], edge_index[1]  # [num_edges]
+        
+        # Create edge features by concatenating source and destination embeddings
+        edge_features = torch.cat([
+            node_embeddings[row],  # Source node embeddings [num_edges, hidden]
+            node_embeddings[col]   # Destination node embeddings [num_edges, hidden]
+        ], dim=1)  # [num_edges, 2 * hidden]
+        
+        # Predict edge flows through MLP
+        edge_flows = self.edge_mlp(edge_features)  # [num_edges, 1]
+        
+        return {"flows": edge_flows}
