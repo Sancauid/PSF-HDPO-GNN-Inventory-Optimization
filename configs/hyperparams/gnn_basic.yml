@@ -1,10 +1,9 @@
 # configs/hyperparams/gnn_basic.yml
 
 optimizer_params: 
-  learning_rate: 0.001 # Las GNNs a veces se benefician de un lr un poco más alto
+  learning_rate: 0.00001
 
 model_params: 
-  architecture: 'gnn' # <-- La clave que activa la lógica de PyG
-  # Parámetros específicos de la GNN (podemos añadirlos más tarde)
+  architecture: 'gnn'
   hidden_channels: 128
   num_layers: 2

@@ -1,0 +1,26 @@
+# configs/settings/graph_topology_example.yml
+# Example configuration with graph topology instead of separate n_stores/n_warehouses
+
+problem_params:
+  # Graph topology definition
+  graph:
+    nodes:
+      - { id: 0, type: 'warehouse', features: { has_external_supply: 1, is_demand_facing: 0 } }
+      - { id: 1, type: 'store',     features: { has_external_supply: 0, is_demand_facing: 1 } }
+      - { id: 2, type: 'store',     features: { has_external_supply: 0, is_demand_facing: 1 } }
+      - { id: 3, type: 'store',     features: { has_external_supply: 0, is_demand_facing: 1 } }
+    edges:
+      - [0, 1]  # warehouse -> store 1
+      - [0, 2]  # warehouse -> store 2  
+      - [0, 3]  # warehouse -> store 3
+  
+  periods: 10
+  
+data_params:
+  n_samples: 32
+
+model_params:
+  architecture: "gnn"
+
+optimizer_params:
+  learning_rate: 0.001

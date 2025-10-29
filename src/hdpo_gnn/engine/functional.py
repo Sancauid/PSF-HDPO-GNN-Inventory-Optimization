@@ -1,108 +1,132 @@
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Tuple
 
 import torch
+from torch_scatter import scatter
 
 
 def transition_step(
-    current_state: Dict[str, torch.Tensor],
-    action: Dict[str, torch.Tensor],
+    current_inventories: torch.Tensor,
+    edge_flows: torch.Tensor,
+    node_features: torch.Tensor,
+    edge_index: torch.Tensor,
     demand_t: torch.Tensor,
-    cost_params: Dict[str, torch.Tensor],
-    lead_times: Dict[str, int],
-) -> Tuple[Dict[str, torch.Tensor], torch.Tensor]:
+    cost_params: Dict[str, Any],
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Pure functional transition: computes next state and per-sample cost.
-
+    Graph-based inventory transition function with edge flows.
+    
+    This function computes the next inventory state and associated costs for a
+    generic graph topology. Flows are requested along edges, subject to per-node
+    feasibility constraints. The function is fully differentiable for end-to-end
+    training of graph neural network policies.
+    
     Args:
-      current_state: Mapping with keys 'inventory_stores' [B,S], 'inventory_warehouses' [B,W],
-        and optionally 'pipeline_stores' [B,S,Ls], 'pipeline_warehouses' [B,W,Lw].
-      action: Mapping with keys 'stores' [B,S] and 'warehouses' [B,W]. Non-negative.
-      demand_t: Tensor [B,S] for current period demand.
-      cost_params: Tensors for costs: 'holding_store', 'underage_store', 'holding_warehouse'.
-      lead_times: Dict with ints 'stores' and 'warehouses'.
-
+        current_inventories: Tensor of shape [B, N] containing current on-hand
+            inventory at each node for each batch sample.
+        edge_flows: Tensor of shape [B, E] containing requested flow quantities
+            along each edge (model's predicted actions).
+        node_features: Tensor of shape [N, F] containing static node features.
+            Feature at index 1 is 'is_demand_facing' (1 for demand-facing nodes,
+            0 otherwise).
+        edge_index: Tensor of shape [2, E] in COO format defining graph connectivity.
+            edge_index[0] are source nodes, edge_index[1] are destination nodes.
+        demand_t: Tensor of shape [B, N] containing external demand at each node
+            for the current time step.
+        cost_params: Dictionary containing cost scalars:
+            - 'holding_store': Cost per unit of inventory held
+            - 'underage_store': Cost per unit of unsatisfied demand
+    
     Returns:
-      next_state: Same structure as current_state, with updated inventories/pipelines.
-      cost: Per-sample cost tensor [B].
+        next_inventories: Tensor of shape [B, N] with updated inventory levels.
+        step_cost: Tensor of shape [B] with total cost for each batch sample.
+    
+    Implementation Details:
+        1. Per-Node Feasibility: Each node can only send out flow up to its current
+           inventory. Uses a numerically stable capping function: 
+           capped = inventory / (requested_outflow + inventory + epsilon)
+        2. Flow Aggregation: Uses torch_scatter to aggregate flows at source and
+           destination nodes, computing inflows and outflows separately.
+        3. Order of Operations: CRITICAL - shipments leave BEFORE sales occur:
+           inventory_after_shipments = current_inventory - outflows
+           sales = min(demand, inventory_after_shipments) at demand-facing nodes
+           next_inventory = inventory_after_shipments + inflows - sales
+        4. Cost Calculation: Holding costs on remaining inventory and underage costs
+           on unsatisfied demand, both masked appropriately by node features.
     """
-    inv_s = current_state["inventory_stores"]
-    inv_w = current_state["inventory_warehouses"]
-    B, S = inv_s.shape
-    W = inv_w.shape[1]
-
-    Ls = int(lead_times.get("stores", 0))
-    Lw = int(lead_times.get("warehouses", 0))
-    pipe_s = current_state.get("pipeline_stores", None)
-    pipe_w = current_state.get("pipeline_warehouses", None)
-
-    a_s = torch.clamp(action["stores"], min=0.0).reshape(B, S)
-    a_w = torch.clamp(action["warehouses"], min=0.0).reshape(B, W)
-
-    if Lw > 0:
-        arrivals_w = pipe_w[:, :, 0] if pipe_w is not None else torch.zeros_like(a_w)
-        new_pipe_w = (
-            torch.cat([pipe_w[:, :, 1:], a_w.unsqueeze(-1)], dim=2)
-            if pipe_w is not None
-            else a_w.unsqueeze(-1)
-        )
-    else:
-        arrivals_w = a_w
-        new_pipe_w = pipe_w
-    inv_w_next = inv_w + arrivals_w
-
-    total_ship_req = a_s.sum(dim=1, keepdim=True)
-    total_wh_inv = inv_w_next.sum(dim=1, keepdim=True)
-    # Smooth, always-differentiable cap in (0,1): ratio / (1 + ratio)
-    feasible_ratio = total_wh_inv / (total_ship_req + 1e-8)
-    feasible_factor = feasible_ratio / (1.0 + feasible_ratio)
-    a_s_feasible = a_s * feasible_factor
-
-    shipped_total = a_s_feasible.sum(dim=1, keepdim=True)
-    inv_share = inv_w_next / (total_wh_inv + 1e-8)
-    deduct_w = inv_share * shipped_total
-    inv_w_next = inv_w_next - deduct_w
-
-    if Ls > 0:
-        arrivals_s = (
-            pipe_s[:, :, 0] if pipe_s is not None else torch.zeros_like(a_s_feasible)
-        )
-        new_pipe_s = (
-            torch.cat([pipe_s[:, :, 1:], a_s_feasible.unsqueeze(-1)], dim=2)
-            if pipe_s is not None
-            else a_s_feasible.unsqueeze(-1)
-        )
-    else:
-        arrivals_s = a_s_feasible
-        new_pipe_s = pipe_s
-    inv_s_mid = inv_s + arrivals_s
-
+    B, N = current_inventories.shape
+    E = edge_index.shape[1]
+    device = current_inventories.device
+    dtype = current_inventories.dtype
+    
+    # Extract source and destination nodes from edge connectivity
+    source = edge_index[0]  # [E]
+    dest = edge_index[1]    # [E]
+    
+    # Ensure edge_flows are non-negative
+    edge_flows = torch.clamp(edge_flows, min=0.0)  # [B, E]
+    
+    # Step 1: Per-Node Feasibility Capping
+    # Calculate total outgoing flow requested from each node
+    # We need to expand source indices for batch dimension
+    source_expanded = source.unsqueeze(0).expand(B, -1)  # [B, E]
+    
+    # Aggregate outgoing flows per node using functional scatter_add (gradient-friendly)
+    total_outgoing_flow = torch.zeros(B, N, device=device, dtype=dtype)
+    total_outgoing_flow = total_outgoing_flow.scatter_add(1, source_expanded, edge_flows)  # [B, N]
+    
+    # Smooth, differentiable feasibility factor
+    # Single-step formula for numerical stability and better gradients:
+    # capped_factor = inventory / (total_outgoing_flow + inventory + epsilon)
+    # This directly calculates the feasible proportion and has much better gradient behavior
+    capped_factor = current_inventories / (total_outgoing_flow + current_inventories + 1e-8)  # [B, N]
+    
+    # Apply capping to edge flows
+    # Each edge's flow is scaled by its source node's capping factor
+    source_capping = capped_factor.gather(1, source_expanded)  # [B, E]
+    feasible_edge_flows = edge_flows * source_capping  # [B, E]
+    
+    # Step 2: Calculate Net Inventory Change
+    # Aggregate inflows and outflows using functional scatter_add (gradient-friendly)
+    dest_expanded = dest.unsqueeze(0).expand(B, -1)  # [B, E]
+    
+    total_in_flow = torch.zeros(B, N, device=device, dtype=dtype)
+    total_in_flow = total_in_flow.scatter_add(1, dest_expanded, feasible_edge_flows)  # [B, N]
+    
+    total_out_flow = torch.zeros(B, N, device=device, dtype=dtype)
+    total_out_flow = total_out_flow.scatter_add(1, source_expanded, feasible_edge_flows)  # [B, N]
+    
+    # Step 3: Calculate intermediate inventory after shipments leave
+    # CRITICAL: Sales must be calculated AFTER shipments have left the node
+    inventory_after_shipments = current_inventories - total_out_flow  # [B, N]
+    
+    # Step 4: Calculate Sales (only at demand-facing nodes)
+    # Smooth approximation of sales = min(demand, inventory_after_shipments)
+    # Use softplus for differentiability: sales = inventory_after_shipments - softplus(inventory_after_shipments - demand) / beta
     beta = 10.0
-    delta = demand_t - inv_s_mid
-    sales = demand_t - torch.nn.functional.softplus(delta, beta=beta) / beta
-    end_inv_s = inv_s_mid - sales
-    underage = demand_t - sales
-
-    hs = cost_params["holding_store"].reshape(-1)
-    us = cost_params["underage_store"].reshape(-1)
-    hw = cost_params["holding_warehouse"].reshape(-1)
-    if hs.numel() == 1:
-        hs = hs.expand(S)
-    if us.numel() == 1:
-        us = us.expand(S)
-    if hw.numel() == 1:
-        hw = hw.expand(W)
-
-    holding_store_cost = (end_inv_s * hs.view(1, S)).sum(dim=1)
-    underage_store_cost = (underage * us.view(1, S)).sum(dim=1)
-    holding_warehouse_cost = (inv_w_next * hw.view(1, W)).sum(dim=1)
-    cost = holding_store_cost + underage_store_cost + holding_warehouse_cost
-
-    next_state = {
-        "inventory_stores": end_inv_s,
-        "inventory_warehouses": inv_w_next,
-    }
-    if Ls > 0:
-        next_state["pipeline_stores"] = new_pipe_s
-    if Lw > 0:
-        next_state["pipeline_warehouses"] = new_pipe_w
-    return next_state, cost
+    
+    # Calculate potential sales for all nodes
+    potential_sales = inventory_after_shipments - torch.nn.functional.softplus(inventory_after_shipments - demand_t, beta=beta) / beta  # [B, N]
+    
+    # Apply hard mask to get final sales (only at demand-facing nodes)
+    is_demand_facing = node_features[:, 1]  # [N]
+    sales = potential_sales * is_demand_facing.unsqueeze(0)  # [B, N]
+    
+    # Step 5: Update Inventories
+    # Final inventory = inventory_after_shipments + inflows - sales
+    next_inventories = inventory_after_shipments + total_in_flow - sales  # [B, N]
+    
+    # Step 6: Calculate Costs
+    # Holding cost: cost per unit of inventory held
+    holding_cost_per_node = next_inventories * cost_params["holding_store"]
+    holding_cost = holding_cost_per_node.sum(dim=1)  # [B]
+    
+    # Underage cost: cost per unit of unsatisfied demand
+    # Only at demand-facing nodes (hard mask ensures correct behavior)
+    underage = demand_t - sales  # [B, N]
+    underage_cost_per_node = underage * cost_params["underage_store"]
+    underage_cost = underage_cost_per_node.sum(dim=1)  # [B]
+    
+    # Total step cost
+    step_cost = holding_cost + underage_cost  # [B]
+    
+    return next_inventories, step_cost

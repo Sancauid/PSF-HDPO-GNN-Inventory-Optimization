@@ -3,66 +3,62 @@ from typing import Any, Dict, List
 import torch
 from torch import Tensor
 from torch_geometric.data import Data
+from omegaconf import DictConfig
+
+from src.hdpo_gnn.utils.graph_parser import parse_graph_topology
 
 
-def create_synthetic_data_dict(config: Dict[str, Any]) -> Dict[str, Any]:
+def create_synthetic_data_dict(config: DictConfig) -> Dict[str, Any]:
     """
-    Create a synthetic dataset dictionary for inventory RL experiments.
+    Create a synthetic dataset dictionary for inventory RL experiments using graph topology.
 
-    This function generates batched initial inventories for stores and warehouses,
-    a time-series of stochastic non-negative demands, cost parameters, and fixed
-    lead times. All numerical arrays are returned as PyTorch tensors to enable
-    GPU execution and differentiation where applicable.
+    This function generates batched initial inventories for all nodes in the graph,
+    a time-series of stochastic non-negative demands (masked to only affect demand-facing nodes),
+    cost parameters, and fixed lead times. All numerical arrays are returned as PyTorch tensors 
+    to enable GPU execution and differentiation where applicable.
 
     Args:
-      config: Configuration mapping. Expected structure:
-        - problem_params: dict with keys
-            * n_stores (int): number of store nodes S
-            * n_warehouses (int): number of warehouse nodes W
-            * periods (int): number of time periods T
-        - data_params: dict with keys
-            * n_samples (int): batch size B (number of scenarios)
+      config: OmegaConf DictConfig containing:
+        - problem_params.graph: Graph topology with nodes and edges
+        - problem_params.periods: Number of time periods T
+        - data_params.n_samples: Batch size B (number of scenarios)
 
     Returns:
       A dictionary with the following keys:
-        - inventories: dict with
-            * 'stores': tensor of shape [B, S]
-            * 'warehouses': tensor of shape [B, W]
-        - demands: tensor of shape [T, B, S] (non-negative)
-        - cost_params: dict with tensors 'holding_store', 'underage_store',
-          and 'holding_warehouse' (scalars as 0-D tensors)
+        - inventories: tensor of shape [B, N] where N is total number of nodes
+        - demands: tensor of shape [T, B, N] (non-negative, masked for demand-facing nodes)
+        - node_features: tensor of shape [N, 2] with features [has_external_supply, is_demand_facing]
+        - edge_index: tensor of shape [2, E] in COO format
+        - cost_params: dict with tensors 'holding_store', 'underage_store', and 'holding_warehouse'
         - lead_times: dict with ints {'stores': 2, 'warehouses': 3}
     """
-    problem_params = config.get("problem_params", {})
-    data_params = config.get("data_params", {})
-
-    num_stores: int = int(problem_params.get("n_stores", 1))
-    num_warehouses: int = int(problem_params.get("n_warehouses", 1))
-    num_periods: int = int(problem_params.get("periods", 1))
-    batch_size: int = int(data_params.get("n_samples", 1))
+    # Parse graph topology
+    node_features, edge_index = parse_graph_topology(config)
+    N = node_features.shape[0]  # Total number of nodes
+    
+    # Extract parameters
+    num_periods: int = int(config.problem_params.periods)
+    batch_size: int = int(config.data_params.n_samples)
 
     device = torch.device("cpu")
     dtype = torch.float32
 
-    # Initialize with realistic starting inventories
-    # Stores start with some inventory to meet initial demand
-    store_inv_dist = torch.distributions.Exponential(
-        rate=torch.tensor(0.2, dtype=dtype, device=device)  # mean = 5
+    # Generate unified inventories for all nodes
+    inventory_dist = torch.distributions.Exponential(
+        rate=torch.tensor(0.15, dtype=dtype, device=device)  # mean = 1/0.15 ≈ 6.67
     )
-    warehouse_inv_dist = torch.distributions.Exponential(
-        rate=torch.tensor(0.1, dtype=dtype, device=device)  # mean = 10
-    )
+    inventories = inventory_dist.rsample((batch_size, N))
 
-    inventories = {
-        "stores": store_inv_dist.rsample((batch_size, num_stores)),
-        "warehouses": warehouse_inv_dist.rsample((batch_size, num_warehouses)),
-    }
-
+    # Generate demands for all nodes
     normal = torch.distributions.Normal(
         loc=torch.tensor(5.0, dtype=dtype, device=device),
         scale=torch.tensor(2.0, dtype=dtype, device=device),
     )
-    demands = normal.rsample((num_periods, batch_size, num_stores)).clamp(min=0.0)
+    raw_demands = normal.rsample((num_periods, batch_size, N)).clamp(min=0.0)
+    
+    # Create demand mask from node features (is_demand_facing is the second feature)
+    demand_mask = node_features[:, 1].unsqueeze(0).unsqueeze(0)  # [1, 1, N]
+    demands = raw_demands * demand_mask  # [T, B, N]
 
     cost_params = {
         "holding_store": torch.tensor(1.0, device=device, dtype=dtype),
@@ -75,55 +71,60 @@ def create_synthetic_data_dict(config: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "inventories": inventories,
         "demands": demands,
+        "node_features": node_features,
+        "edge_index": edge_index,
         "cost_params": cost_params,
         "lead_times": lead_times,
     }
 
 
-def create_pyg_dataset(data: Dict[str, Any], config: Dict[str, Any]) -> List[Data]:
+def create_pyg_dataset(data: Dict[str, Any], config: DictConfig) -> List[Data]:
     """
     Convert synthetic tensors into a list of PyG `Data` graphs for GNN models.
 
-    Each sample `i` becomes a graph with `n_stores` nodes and a fully-connected
-    directed edge set (excluding self-loops). Node features contain the initial
-    store inventories for that sample. Additional tensors relevant for simulation
-    (e.g., demands, cost parameters, lead times) are attached as attributes.
+    Each sample becomes a graph with N nodes using the graph topology defined in the config.
+    All graphs share the same node features and edge connectivity, but have different
+    initial inventories and demand time-series per sample.
 
     Args:
-        data: Output of `create_synthetic_data_dict`, including keys
-          'inventories', 'demands', 'cost_params', 'lead_times'.
-        config: Config mapping with 'data_params' and 'problem_params'.
+        data: Output of `create_synthetic_data_dict`, containing:
+          - 'inventories': tensor of shape [B, N] - initial inventories per sample
+          - 'demands': tensor of shape [T, B, N] - demand time-series per sample
+          - 'node_features': tensor of shape [N, F] - static node features
+          - 'edge_index': tensor of shape [2, E] - graph connectivity
+          - 'cost_params': dict with cost parameters
+          - 'lead_times': dict with lead time parameters
+        config: DictConfig containing graph topology and other parameters
 
     Returns:
-        A list of `torch_geometric.data.Data` objects, one per sample.
+        A list of `torch_geometric.data.Data` objects, one per sample. Each Data object contains:
+          - x: Node features tensor [N, F] (same for all graphs)
+          - edge_index: Graph connectivity [2, E] (same for all graphs)
+          - initial_inventory: Initial inventories for this sample [N]
+          - demands: Demand time-series for this sample [T, N]
+          - cost_params and lead_times as scalar attributes
     """
-    problem_params = config.get("problem_params", {})
-    data_params = config.get("data_params", {})
-
-    n_samples: int = int(data_params.get("n_samples", data["demands"].shape[1]))
-    n_stores: int = int(
-        problem_params.get("n_stores", data["inventories"]["stores"].shape[1])
-    )
-
-    stores_inv: Tensor = data["inventories"]["stores"]  # [B, S]
-    demands: Tensor = data["demands"]  # [T, B, S]
-    cost_params: Dict[str, Tensor] = data["cost_params"]
-    lead_times: Dict[str, int] = data["lead_times"]
-
-    idx = torch.arange(n_stores, dtype=torch.long)
-    src = idx.repeat_interleave(n_stores)
-    dst = idx.repeat(n_stores)
-    mask = src != dst
-    edge_index = torch.stack([src[mask], dst[mask]], dim=0)  # [2, E]
+    # Extract dimensions from data
+    inventories = data["inventories"]  # [B, N]
+    demands = data["demands"]  # [T, B, N]
+    node_features = data["node_features"]  # [N, F]
+    edge_index = data["edge_index"]  # [2, E]
+    cost_params = data["cost_params"]
+    lead_times = data["lead_times"]
+    
+    B, N = inventories.shape
+    T = demands.shape[0]
 
     data_list: List[Data] = []
-    for i in range(n_samples):
-        x_i = stores_inv[i].unsqueeze(-1)  # [S, 1]
-        d_i = demands[:, i, :]  # [T, S]
-
-        g = Data(x=x_i, edge_index=edge_index)
-        g.demands = d_i
-
+    for i in range(B):
+        # Create PyG Data object
+        g = Data(x=node_features, edge_index=edge_index)
+        
+        # Attach sample-specific data
+        g.initial_inventory = inventories[i]  # [N]
+        g.demands = demands[:, i, :]  # [T, N]
+        
+        # Attach cost parameters and lead times
         g.holding_store = cost_params["holding_store"].detach().clone()
         g.underage_store = cost_params["underage_store"].detach().clone()
         g.holding_warehouse = cost_params["holding_warehouse"].detach().clone()
