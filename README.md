@@ -8,19 +8,23 @@ The goal of this project is to implement and extend the research from "Deep Rein
 
 ### Key Design Principles
 
-- **Generic Graph Topology:** The system models inventory networks as arbitrary directed graphs defined in YAML configuration files. Nodes represent locations (warehouses, stores, distribution centers) with static features (e.g., `has_external_supply`, `is_demand_facing`), and edges represent possible shipment routes.
+- **Generic Graph Topology:** The system models inventory networks as arbitrary directed graphs defined in YAML configuration files. Nodes represent locations (warehouses, stores, distribution centers) with static features, and edges represent possible shipment routes with lead times and costs.
 
 - **Edge GNN Architecture:** The policy is a Graph Neural Network that predicts **edge flows** (shipment quantities) rather than node-level values. This naturally aligns with the physics of inventory networks where decisions are about moving goods between locations.
 
-- **State-Dependent Learning:** At each time step, the GNN receives **dynamic node features** constructed by concatenating static node properties with current simulation state (on-hand inventory and current demand). This enables the model to learn true, state-dependent policies that respond to real-time conditions.
+- **State-Dependent Learning:** At each time step, the GNN receives **dynamic node features** constructed by concatenating static node properties with current simulation state (on-hand inventory, outstanding orders, and current demand). This enables the model to learn true, state-dependent policies that respond to real-time conditions.
 
 - **HDPO Framework:** Unlike traditional RL methods that rely on high-variance estimators (like REINFORCE), HDPO treats the entire simulation as a differentiable computation graph. This allows for stable, low-variance gradient updates by backpropagating directly through the known system dynamics.
 
-- **Optimization Objective:** The framework minimizes a cost function comprising holding costs (for excess inventory) and underage costs (for unmet demand). The optimizer finds policy parameters θ that minimize expected total cost over simulation episodes.
+- **Optimization Objective:** The framework minimizes a cost function comprising holding costs (for excess inventory), underage costs (for unmet demand), and procurement costs (for external supplier orders). The optimizer finds policy parameters θ that minimize expected total cost over simulation episodes.
 
-## Current Milestone
+- **Feasibility Enforcement Layer (FEL):** The system includes a differentiable feasibility enforcement mechanism that ensures all actions respect inventory constraints while maintaining gradient flow.
 
-**Project Complete:** The full, end-to-end HDPO training framework with generic graph-based topology is implemented, numerically validated via `torch.autograd.gradcheck`, and ready for experimentation.
+- **Differentiable Pipeline:** In-transit inventory is managed through a differentiable pipeline system that tracks orders across multiple lead times, enabling accurate modeling of supply chain delays.
+
+## Current Status
+
+**Project Complete:** The full, end-to-end HDPO training framework with generic graph-based topology is implemented, including FEL, differentiable pipeline, and procurement costs. The system supports hyperparameter sweeps and is ready for experimentation.
 
 ## 2. Project Architecture
 
@@ -29,140 +33,170 @@ The codebase is organized into a modular `src` package to ensure clarity, mainta
 ```
 /
 ├── configs/
-│   ├── settings/                    # Problem definitions (graph topology, simulation params)
-│   │   ├── graph_simple.yml         # Example: 1 warehouse → 3 stores
-│   │   └── graph_topology_example.yml
-│   └── hyperparams/                 # Model and optimizer configurations
-│       ├── gnn_basic.yml
-│       └── gnn_conservative.yml
+│   └── experiments/                   # Unified experiment configurations
+│       ├── S4_OWMS_synthetic.yml      # Example: One Warehouse, Multiple Stores
+│       └── ...
 ├── src/
-│   └── hdpo_gnn/                    # The core Python package
+│   └── hdpo_gnn/                      # The core Python package
 │       ├── data/
-│       │   └── datasets.py          # Synthetic data generation and PyG dataset creation
+│       │   └── dataset_manager.py     # Data generation, splitting, and loading
 │       ├── engine/
-│       │   └── functional.py        # Core differentiable simulation physics
+│       │   ├── functional.py          # Core differentiable simulation physics
+│       │   ├── fel.py                 # Feasibility Enforcement Layer
+│       │   └── pipeline.py            # DifferentiablePipeline for in-transit inventory
 │       ├── models/
-│       │   └── gnn.py               # Edge GNN policy network
+│       │   ├── factory.py            # Model factory for dynamic model creation
+│       │   └── paper_gnn.py           # Paper's GNN policy network
 │       ├── training/
-│       │   ├── engine.py            # Simulation orchestration and loss calculation
-│       │   └── trainer.py           # Training loop coordinator
+│       │   ├── simulation_engine.py  # Simulation orchestration and episode execution
+│       │   └── trainer.py             # Training loop coordinator
 │       └── utils/
-│           ├── config_loader.py     # OmegaConf-based configuration loading
-│           └── graph_parser.py      # YAML graph topology parser
-├── tests/                           # Comprehensive test suite
-│   ├── data/
-│   │   └── test_datasets.py
-│   ├── models/
-│   │   └── test_gnn.py
-│   ├── training/
-│   │   ├── test_engine.py
-│   │   └── test_end_to_end.py       # Includes numerical gradient check
-│   └── utils/
-│       └── test_graph_parser.py
-└── train.py                         # Main entry point for experiments
+│           └── environment_builder.py # Environment construction from config
+├── run_experiment.py                  # Manager script for hyperparameter sweeps
+└── train.py                           # Worker script for single training runs
 ```
 
-### 2.1. `configs/` - Experiment Definitions
+### 2.1. `configs/experiments/` - Unified Experiment Configurations
 
-Experiments are defined by combining two YAML files:
-1. **Settings file** (`configs/settings/*.yml`): Defines the graph topology, simulation parameters, and data generation settings
-2. **Hyperparameters file** (`configs/hyperparams/*.yml`): Defines model architecture and optimizer settings
+Experiments are now defined in a single unified YAML file that combines:
+- **Environment definition:** Graph topology, demand generation, cost parameters, lead times
+- **Feature engineering:** Dynamic and static features to include
+- **Data handling:** Split policies, scenario counts, episode lengths
+- **Model architecture:** GNN parameters, FEL type
+- **Training configuration:** Optimizer settings, epochs, early stopping
 
 ### 2.2. `src/hdpo_gnn/` - The Core Package
 
-- **`utils/graph_parser.py`:**
-  - `parse_graph_topology(config)`: Parses YAML graph definition into PyTorch tensors (`node_features` and `edge_index`)
-  - `validate_graph_topology(config)`: Validates graph structure and feature consistency
-  - `get_node_type_counts(config)`: Extracts node type statistics for analysis
+- **`utils/environment_builder.py`:**
+  - `Environment`: Builds the supply chain environment from configuration
+  - Creates graph topology, node features, edge parameters (lead times, costs)
+  - Generates procurement costs and manages edge parameters
 
-- **`data/datasets.py`:**
-  - `create_synthetic_data_dict(config)`: Generates a dictionary of PyTorch tensors representing simulation scenarios. Uses the graph parser to extract topology, then generates random initial inventories and demands. Demands are masked to only apply to demand-facing nodes.
-  - `create_pyg_dataset(data, config)`: Converts the synthetic data dictionary into a list of `torch_geometric.data.Data` graphs for the GNN model.
+- **`data/dataset_manager.py`:**
+  - `DatasetManager`: Orchestrates data generation, splitting, and loading
+  - `PyGInventoryDataset`: PyTorch Geometric dataset wrapper
+  - Generates synthetic scenarios and manages train/dev/test splits
 
 - **`engine/functional.py`:**
-  - `transition_step(current_inventories, edge_flows, node_features, edge_index, demand_t, cost_params)`: Pure functional simulator physics. Implements per-node feasibility capping, flow aggregation using `torch_scatter`, smooth sales calculation, and cost computation. Fully differentiable with no gradient breaks.
+  - `transition_step(...)`: Pure functional simulator physics
+  - Implements per-node feasibility capping, flow aggregation using `torch_scatter`
+  - Smooth sales calculation, cost computation (holding, underage, procurement)
+  - Fully differentiable with no gradient breaks
 
-- **`models/gnn.py`:**
-  - `GNNPolicy`: Edge GNN that uses GCN layers to create node embeddings, then concatenates source and destination node embeddings for each edge and passes them through an MLP to predict edge flows.
+- **`engine/fel.py`:**
+  - `apply_fel(...)`: Feasibility Enforcement Layer dispatcher
+  - `g1a_full_allocation_proportional(...)`: Full Allocation Proportional FEL for transshipment
+  - `g1_proportional_allocation(...)`: Standard proportional allocation
+  - Ensures actions respect inventory constraints while maintaining differentiability
 
-- **`training/engine.py`:**
-  - `prepare_batch_for_simulation(batch, device)`: Prepares PyG Batch objects for simulation, extracting dynamic data and static graph structure.
-  - `run_simulation_episode(model, pyg_batch, data_for_reset, periods, ignore_periods)`: **Critical function** that orchestrates the multi-period simulation. At each time step, it constructs dynamic node features by concatenating static features with current inventory and demand, calls the GNN model, and steps the simulation forward using `transition_step`.
-  - `calculate_losses(...)`: Computes training loss from episode costs.
-  - `perform_gradient_step(...)`: Executes gradient clipping and optimizer update.
+- **`engine/pipeline.py`:**
+  - `DifferentiablePipeline`: Manages in-transit inventory queues
+  - Tracks orders across multiple lead times with device-aware buffer management
+  - Methods: `get_arrivals()`, `place_orders()`, `advance_step()`
+
+- **`models/paper_gnn.py`:**
+  - `PaperGNNPolicy`: Faithful implementation of the paper's GNN architecture
+  - Message-passing layers with configurable width and depth
+  - Predicts edge flows from node features
+
+- **`models/factory.py`:**
+  - `ModelFactory`: Dynamically creates models based on configuration
+  - Calculates input feature dimensions from feature specifications
+  - Handles model architecture selection and hyperparameter configuration
+
+- **`training/simulation_engine.py`:**
+  - `run_simulation_episode(...)`: **Critical function** that orchestrates multi-period simulation
+  - Integrates FEL, pipeline, and feature construction
+  - At each time step: constructs dynamic features, calls GNN, applies FEL, steps physics, updates pipeline
+  - Returns total episode cost and reported costs (after warmup)
 
 - **`training/trainer.py`:**
-  - `Trainer`: Training orchestrator that manages the epoch loop, batch processing, and scheduler updates.
+  - `Trainer`: Training orchestrator that manages epoch loop, batch processing, validation, and early stopping
 
-### 2.3. `train.py` - The Entry Point
+### 2.3. `run_experiment.py` - Hyperparameter Sweep Manager
 
-A lightweight script responsible for:
-1. Parsing command-line arguments (config paths, epochs)
-2. Loading and merging configurations using OmegaConf
-3. Generating synthetic data and creating PyG dataset
-4. Instantiating the GNN model, optimizer, and trainer
-5. Launching the training process
+The manager script orchestrates hyperparameter sweeps:
+- Reads experiment configuration
+- Extracts hyperparameter lists (e.g., learning rates)
+- Launches `train.py` as subprocess workers for each hyperparameter combination
+- Captures and displays output from each training run
+- Provides summary of all runs
+
+### 2.4. `train.py` - Training Worker Script
+
+A worker script for single training runs:
+- Accepts learning rate as command-line argument (`--lr`)
+- Loads unified experiment configuration
+- Initializes environment, dataset manager, model, optimizer, and trainer
+- Executes full training process
+- Can be run standalone or orchestrated by `run_experiment.py`
 
 ## 3. Data Flow & Execution Logic
 
 The end-to-end data flow for a single training step:
 
-1. **Graph Definition:** User defines the supply chain topology in a YAML file with nodes (features: `has_external_supply`, `is_demand_facing`) and edges (shipment routes).
+1. **Environment Construction:** `Environment` builds graph topology from config, creating node features, edge indices, and edge parameters (lead times, costs).
 
-2. **Data Generation:** `create_synthetic_data_dict` parses the graph topology, generates random initial inventories `[B, N]` and demands `[T, B, N]`, and masks demands to only apply to demand-facing nodes.
+2. **Data Generation:** `DatasetManager` generates synthetic scenarios with random initial inventories `[B, N]` and demands `[T, B, N]`, masks demands to demand-facing nodes, and creates PyG datasets.
 
-3. **PyG Dataset Creation:** `create_pyg_dataset` creates one `torch_geometric.data.Data` object per sample, attaching static node features, edge connectivity, initial inventories, and per-sample demands.
-
-4. **Training Loop:** The `Trainer` receives mini-batches from the DataLoader and processes each batch:
+3. **Training Loop:** The `Trainer` receives mini-batches from the DataLoader and processes each batch:
    
-   a. `prepare_batch_for_simulation` extracts the batch structure
-   
-   b. `run_simulation_episode` orchestrates the multi-period simulation:
+   a. `run_simulation_episode` orchestrates the multi-period simulation:
       - **For each time step t:**
-        - **Dynamic Feature Construction (KEY TO LEARNING):** Concatenates static node features with current inventory and current demand to create `dynamic_x = [static_features, inventory_t, demand_t]`
-        - **GNN Forward Pass:** Model receives `dynamic_x` and predicts edge flows
-        - **Physics Step:** `transition_step` computes feasibility-capped flows, updates inventories, calculates sales, and computes costs
-        - **State Update:** Current inventories are updated for next time step
+        - **Dynamic Feature Construction:** Concatenates static node features with current inventory, outstanding orders (from pipeline), demand, and static parameters (costs, lead times)
+        - **GNN Forward Pass:** Model receives `dynamic_x` and predicts raw edge logits
+        - **FEL Application:** `apply_fel` enforces feasibility constraints on raw logits
+        - **Physics Step:** `transition_step` computes feasible flows, updates inventories, calculates sales, computes costs (holding, underage, procurement)
+        - **Pipeline Update:** Places orders into pipeline queues, advances time step, retrieves arrivals
+        - **State Update:** Current inventories are updated with arrivals
    
-   c. Loss is calculated from accumulated episode costs
+   b. Loss is calculated from accumulated episode costs
    
-   d. `loss.backward()` propagates gradients through the entire multi-period episode
+   c. `loss.backward()` propagates gradients through the entire multi-period episode
    
-   e. `optimizer.step()` updates the GNN parameters
+   d. `optimizer.step()` updates the GNN parameters
 
 ### 3.1. End-to-end Computation Graph (Visual Flow)
 
 ```
-train.py
+run_experiment.py
+   ↓
+train.py (worker)
    ↓
 Trainer.train()
    ↓
-Trainer._train_batch()
-   ↓
-prepare_batch_for_simulation  ← extracts batch structure
+Trainer._run_epoch()
    ↓
 run_simulation_episode
    ↓
-   ├─→ [for t in periods]:
+   ├─→ [for t in episode_length]:
    │      ↓
    │   ┌─────────────────────────────────────────────────┐
-   │   │ DYNAMIC FEATURE CONSTRUCTION (KEY TO LEARNING)  │
+   │   │ DYNAMIC FEATURE CONSTRUCTION                    │
    │   │ dynamic_x = [static_features, inventory_t,      │
-   │   │              demand_t]                           │
+   │   │              outstanding_orders_t, demand_t,   │
+   │   │              holding_cost, underage_cost,       │
+   │   │              lead_time]                         │
    │   └─────────────────────────────────────────────────┘
    │      ↓
-   │   model.forward(dynamic_x, edge_index) → edge_flows  [GRADIENTS FLOW]
+   │   model.forward(dynamic_x, edge_index) → raw_logits [GRADIENTS FLOW]
    │      ↓
-   │   softplus(edge_flows) → feasible_flows              [GRADIENTS FLOW]
+   │   fel.apply_fel(raw_logits, inventory, ...) → feasible_flows [GRADIENTS FLOW]
    │      ↓
-   │   transition_step(inventory_t, flows, demand_t, ...) [GRADIENTS FLOW]
+   │   pipeline.get_arrivals() → arrivals [GRADIENTS FLOW]
    │      ↓
-   │   (next_inventory, step_cost)
+   │   transition_step(inventory + arrivals, flows, demand, ...) [GRADIENTS FLOW]
    │      ↓
-   │   total_episode_cost += step_cost                    [GRADIENTS ACCUMULATE]
+   │   (next_inventory, step_cost) [GRADIENTS ACCUMULATE]
+   │      ↓
+   │   pipeline.place_orders(orders, lead_times) [GRADIENTS FLOW]
+   │      ↓
+   │   pipeline.advance_step() [GRADIENTS FLOW]
+   │      ↓
+   │   total_episode_cost += step_cost
    │
    ↓
-calculate_losses(total_episode_cost, ...) → loss_for_backward
+loss = total_episode_cost.mean()
    ↓
 loss.backward()  ← BACKPROP THROUGH ENTIRE MULTI-PERIOD EPISODE
    ↓
@@ -171,9 +205,10 @@ optimizer.step()  ← UPDATE GNN PARAMETERS
 
 **Key differentiability guarantees:**
 - Sales calculation uses smooth `softplus`-based approximation: `sales = inventory - softplus(inventory - demand) / β`
-- Feasibility capping uses numerically stable formula: `capped_factor = inventory / (requested_flow + inventory + ε)`
-- All operations in `transition_step` use `torch.scatter_add` (functional form) to preserve gradients
-- Dynamic feature construction at each time step enables state-dependent learning
+- Feasibility enforcement uses differentiable capping: `capped_factor = inventory / (requested_flow + inventory + ε)`
+- FEL maintains gradient flow through proportional allocation
+- Pipeline operations use device-aware buffers that preserve gradients
+- All operations in `transition_step` use `torch.scatter_add` to preserve gradients
 
 ### 3.2. Tensor Shapes and Semantics
 
@@ -182,111 +217,115 @@ optimizer.step()  ← UPDATE GNN PARAMETERS
 - `N`: number of nodes in the graph (total locations)
 - `E`: number of edges in the graph (shipment routes)
 - `T`: simulation periods (time horizon)
-- `F`: number of static node features (typically 2: `has_external_supply`, `is_demand_facing`)
+- `L`: maximum lead time (for outstanding orders feature)
 
 | Component | Tensor/Field | Shape | Semantics |
 |-----------|--------------|-------|-----------|
-| **Graph Topology** | `node_features` | `[N, F]` | Static node properties (same for all samples) |
+| **Graph Topology** | `static_node_features` | `[N, F_static]` | Static node properties (node type encoding) |
 | | `edge_index` | `[2, E]` | Graph connectivity in COO format |
-| **Initial State** | `inventories` | `[B, N]` | Starting inventory at each node |
-| **Demand** | `demands` | `[T, B, N]` | Per-node demand over time (masked for non-demand-facing nodes) |
-| **Cost Parameters** | `holding_store` | scalar | Holding cost per unit per period |
-| | `underage_store` | scalar | Underage/stockout cost per unit per period |
-| | `holding_warehouse` | scalar | Warehouse holding cost per unit per period |
-| **Dynamic Features (per step)** | `dynamic_x` | `[B*N, F+2]` | Concatenation of static features, current inventory, current demand |
-| **Actions (per step)** | `edge_flows` | `[B, E]` | Predicted shipment quantities on each edge |
+| | `edge_lead_times` | `[E]` | Lead time for each edge |
+| **Initial State** | `initial_inventory` | `[B, N]` | Starting inventory at each node |
+| **Demand** | `demands` | `[B, T, N]` | Per-node demand over time |
+| **Cost Parameters** | `holding_costs` | `[B, N]` | Holding cost per unit per period per node |
+| | `underage_costs` | `[B, N]` | Underage/stockout cost per unit per period per node |
+| | `procurement_costs` | `[E]` | Procurement cost per unit per edge (supplier edges) |
+| **Dynamic Features (per step)** | `dynamic_x` | `[B*N, F_total]` | Concatenation of static features, inventory, outstanding orders, demand, static parameters |
+| **Pipeline State** | `pipeline.queues[lt]` | `[B, N, lt]` | In-transit inventory for lead time `lt` |
+| **Actions (per step)** | `feasible_edge_flows` | `[B, E]` | Feasibility-capped shipment quantities |
 | **Episode Outputs** | `total_episode_cost` | `[B]` | Sum of costs over all T periods |
-| | `cost_to_report` | `[B]` | Sum of costs over last `max(T - ignore_periods, 1)` periods |
-
-**Key notes:**
-- PyG batches graphs by stacking: `[B*N, F]` for node features, `[B*E, 1]` for edge predictions
-- `run_simulation_episode` reshapes these back to standard batch format `[B, N]` and `[B, E]`
-- Dynamic feature construction happens **at every time step** using current simulation state
+| | `reported_costs` | `[B]` | Sum of costs over last `max(T - warmup_periods, 1)` periods |
 
 ## 4. Configuration Schema
 
-### 4.1. Settings File (Graph Topology and Simulation Parameters)
+### 4.1. Unified Experiment Configuration
 
-Example: `configs/settings/graph_simple.yml`
+Example: `configs/experiments/S4_OWMS_synthetic.yml`
 
 ```yaml
-# Problem definition: graph topology and simulation parameters
-problem_params:
-  # Simulation horizon (number of time periods)
-  periods: 10
-  
-  # Warm-up periods excluded from reported cost (but gradients still flow)
-  ignore_periods: 0
-  
-  # Graph topology definition
-  graph:
+# 1. METADATA & EXPERIMENT SETUP
+experiment:
+  name: "S4_OWMS_Backlogged_Transshipment_50S_128Scenarios"
+  setting_id: "S4"
+  seed: 42
+  device: "cuda"
+
+# 2. ENVIRONMENT DEFINITION
+environment:
+  topology:
+    generator: "from_rules"
+    rules:
+      node_counts: { warehouse: 1, store: 50 }
+      edge_policy: "warehouse_to_all_stores"
+  demand:
+    source: "synthetic"
+    synthetic_data_config:
+      distribution: "normal"
+      mean_range: [2.5, 7.5]
+      cv_range: [0.25, 0.5]
+      correlation: 0.5
+  parameters:
     nodes:
-      # Node 0: Warehouse (has external supply, not demand-facing)
-      - id: 0
-        type: 'warehouse'
-        features:
-          has_external_supply: 1
-          is_demand_facing: 0
-      
-      # Nodes 1-3: Stores (no external supply, demand-facing)
-      - id: 1
-        type: 'store'
-        features:
-          has_external_supply: 0
-          is_demand_facing: 1
-      - id: 2
-        type: 'store'
-        features:
-          has_external_supply: 0
-          is_demand_facing: 1
-      - id: 3
-        type: 'store'
-        features:
-          has_external_supply: 0
-          is_demand_facing: 1
-    
-    # Edges define possible shipment routes (source → destination)
+      stores:
+        holding_cost: { sampling_method: "fixed", value: 1.0 }
+        underage_cost: { sampling_method: "fixed", value: 9.0 }
+      warehouses:
+        holding_cost: { sampling_method: "fixed", value: 0.0 }
     edges:
-      - [0, 1]  # Warehouse → Store 1
-      - [0, 2]  # Warehouse → Store 2
-      - [0, 3]  # Warehouse → Store 3
+      supplier_to_warehouse:
+        lead_time: { sampling_method: "fixed", value: 3 }
+        procurement_cost: { sampling_method: "fixed", value: 0.0 }
+      warehouse_to_store:
+        lead_time: { sampling_method: "fixed", value: 4 }
+  dynamics:
+    unmet_demand_assumption: "backlogged"
+    is_transshipment: true
+    objective: "minimize_cost"
 
-# Data generation parameters
-data_params:
-  n_samples: 1000        # Number of training samples
-  batch_size: 256        # Mini-batch size for SGD
+# 3. FEATURE ENGINEERING
+features:
+  dynamic: ["inventory_on_hand", "outstanding_orders"]
+  static: ["holding_cost", "underage_cost", "lead_time"]
+  demand_history: { past_periods: 0 }
+  time_features: null
 
-# Cost parameters
-cost_params:
-  holding_store: 1.0     # Cost per unit of inventory held per period
-  underage_store: 9.0    # Cost per unit of unmet demand per period
-  holding_warehouse: 0.5 # Warehouse holding cost per unit per period
+# 4. DATA HANDLING
+data:
+  split_policy: "random"
+  scenarios: { train: 128, dev: 128, test: 8192 }
+  episode_length: { train: 50, dev: 100, test: 5000 }
+  warmup_periods: { train: 30, dev: 60, test: 3000 }
+  batch_size: 128
+
+# 5. MODEL ARCHITECTURE
+model:
+  architecture_class: "gnn"
+  gnn_params:
+    fel_type: "g1a"  # Full Allocation Proportional for transshipment
+    message_passing_layers: 2
+    module_layers: 2
+    module_width: 32
+    weight_sharing: true
+
+# 6. TRAINING PROCESS (HDPO)
+training:
+  optimizer:
+    name: "adam"
+    lr: 0.01  # Can be a list for hyperparameter sweeps: [0.0001, 0.001, 0.01]
+    betas: [0.9, 0.999]
+  epochs: 100
+  early_stopping_patience: 20
+  softplus_bias: 5.0
+  gradient_clip_norm: 1.0
 ```
 
-**Node Features Explained:**
-- `has_external_supply`: 1 if the node can receive unlimited external supply (e.g., warehouse), 0 otherwise
-- `is_demand_facing`: 1 if the node experiences customer demand, 0 otherwise (used to mask demand tensor)
+**Key Configuration Sections:**
 
-**Edges:** Define the directed graph structure. Each edge `[source, dest]` represents a possible shipment route.
-
-### 4.2. Hyperparameters File (Model and Optimizer Settings)
-
-Example: `configs/hyperparams/gnn_conservative.yml`
-
-```yaml
-# Optimizer configuration
-optimizer_params:
-  learning_rate: 0.00003  # Conservative learning rate for stable training
-
-# Model architecture
-model_params:
-  hidden_channels: 64     # GNN hidden layer width
-  num_layers: 2           # Number of GCN message-passing layers
-
-# Training configuration
-training_params:
-  grad_clip_norm: 1.0     # Gradient clipping threshold
-```
+1. **`experiment`**: Metadata, random seed, compute device
+2. **`environment`**: Graph topology generation, demand source, cost parameters, lead times, dynamics
+3. **`features`**: Dynamic features (inventory, outstanding orders), static features (costs, lead times), optional demand history
+4. **`data`**: Split policy, scenario counts, episode lengths, warmup periods, batch size
+5. **`model`**: Architecture class, GNN hyperparameters (layers, width), FEL type
+6. **`training`**: Optimizer settings (learning rate can be a list for sweeps), epochs, early stopping, softplus bias, gradient clipping
 
 ## 5. How to Use
 
@@ -295,45 +334,79 @@ training_params:
 Clone the repository and install dependencies:
 
 ```bash
-git clone https://github.com/Sancauid/PSF-HDPO-GNN-Inventory-Optimization.git
-cd PSF-HDPO-GNN-Inventory-Optimization
+git clone <repository-url>
+cd gnn_from_scratch
 
 # Activate your conda environment with PyTorch and PyTorch Geometric
 conda activate pyg_env
 
 # Install the package in editable mode
 pip install -e .
-
-# Install testing dependencies
-pip install pytest
 ```
 
-### 5.2. Running Tests
+### 5.2. Running a Single Training Run
 
-Verify the integrity of all components by running the comprehensive test suite:
+Run a single training session with a specific learning rate:
 
 ```bash
-pytest tests/ -v
+python train.py configs/experiments/S4_OWMS_synthetic.yml --lr 0.001
 ```
 
-The test suite includes:
-- Unit tests for all core components
-- Integration tests for the training pipeline
-- **Numerical gradient check** (`torch.autograd.gradcheck`) that validates end-to-end differentiability
-
-### 5.3. Running Training
-
-Launch a training run from the root directory:
+Add `-v` or `--verbose` for DEBUG-level logging:
 
 ```bash
-# Example: Train on the simple graph topology for 100 epochs
-python train.py configs/settings/graph_simple.yml configs/hyperparams/gnn_conservative.yml --epochs 100
+python train.py configs/experiments/S4_OWMS_synthetic.yml --lr 0.001 -v
+```
+
+### 5.3. Running Hyperparameter Sweeps
+
+The recommended way to run experiments is through the manager script, which supports hyperparameter sweeps:
+
+```bash
+python run_experiment.py configs/experiments/S4_OWMS_synthetic.yml -v
+```
+
+**What happens:**
+1. `run_experiment.py` loads the experiment configuration
+2. Extracts the learning rate list from `training.optimizer.lr` (if it's a list)
+3. For each learning rate:
+   - Launches `train.py` as a subprocess with `--lr <learning_rate>`
+   - Captures and displays all output in real-time
+   - Waits for completion before proceeding to next learning rate
+4. Provides a summary of all runs at the end
+
+**To specify learning rates in the config:**
+
+```yaml
+training:
+  optimizer:
+    lr: [0.0001, 0.001, 0.01]  # List of learning rates to sweep
 ```
 
 **Training Output:**
-- Epoch-level loss reporting
-- Automatic learning rate scheduling (ReduceLROnPlateau)
-- Progress bars for batch processing
+- Real-time progress bars for each training run
+- Epoch-level loss reporting (training and validation)
+- Automatic early stopping based on validation loss
+- Gradient clipping for stability
+- Summary of all hyperparameter combinations at the end
+
+### 5.4. Hyperparameter Sweep Configuration
+
+To run a hyperparameter sweep, modify the learning rate in your experiment config to be a list:
+
+```yaml
+training:
+  optimizer:
+    lr: [0.0001, 0.001, 0.01]  # Will run 3 separate training sessions
+```
+
+Then run:
+
+```bash
+python run_experiment.py configs/experiments/S4_OWMS_synthetic.yml
+```
+
+Each learning rate will trigger a complete training run from start to finish.
 
 ## 6. Training & Hyperparameters
 
@@ -341,66 +414,108 @@ python train.py configs/settings/graph_simple.yml configs/hyperparams/gnn_conser
 
 Training differentiable physics models like this is **highly sensitive** to problem difficulty and hyperparameters. The two most critical parameters are:
 
-1. **`periods` (simulation horizon):** Longer horizons create deeper computation graphs, making optimization harder
-2. **`learning_rate`:** Controls the magnitude of parameter updates
+1. **`episode_length.train` (simulation horizon):** Longer horizons create deeper computation graphs, making optimization harder
+2. **`training.optimizer.lr` (learning rate):** Controls the magnitude of parameter updates
 
 ### 6.2. Recommended Starting Point
 
-**Users should start with a short `periods` (e.g., 10-20) and a conservative `learning_rate` (e.g., 1e-4 to 3e-5) to establish a stable learning baseline before attempting to solve problems with longer time horizons.**
+**Users should start with a short `episode_length.train` (e.g., 50) and a conservative `learning_rate` (e.g., 0.001) to establish a stable learning baseline before attempting to solve problems with longer time horizons.**
 
 Example progression:
-1. Start: `periods: 10`, `learning_rate: 0.00003` (3e-5)
-2. Once stable: Increase to `periods: 20`, keep same learning rate
-3. Advanced: `periods: 50`, reduce to `learning_rate: 0.00001` (1e-5)
+1. Start: `episode_length.train: 50`, `lr: 0.001`
+2. Once stable: Increase to `episode_length.train: 100`, keep same learning rate
+3. Advanced: `episode_length.train: 500`, reduce to `lr: 0.0001`
 
 ### 6.3. Key Hyperparameters
 
 | Parameter | Location | Typical Range | Notes |
 |-----------|----------|---------------|-------|
-| `periods` | settings file | 10-50 | Start small (10-20) for initial experiments |
-| `learning_rate` | hyperparams file | 1e-5 to 1e-4 | Lower is safer; use 3e-5 as default |
-| `batch_size` | settings file | 128-512 | Larger batches = more stable gradients |
-| `n_samples` | settings file | 1000-5000 | More samples = better generalization |
-| `grad_clip_norm` | hyperparams file | 0.5-2.0 | Prevents exploding gradients |
-| `hidden_channels` | hyperparams file | 32-128 | GNN capacity; 64 is a good default |
+| `episode_length.train` | `data` section | 50-500 | Start small (50-100) for initial experiments |
+| `training.optimizer.lr` | `training` section | 0.0001-0.01 | Lower is safer; use 0.001 as default |
+| `data.batch_size` | `data` section | 64-256 | Larger batches = more stable gradients |
+| `data.scenarios.train` | `data` section | 128-8192 | More samples = better generalization |
+| `training.gradient_clip_norm` | `training` section | 0.5-2.0 | Prevents exploding gradients |
+| `model.gnn_params.module_width` | `model` section | 32-128 | GNN capacity; 32-64 is a good default |
+| `model.gnn_params.message_passing_layers` | `model` section | 2-4 | More layers = more expressive, but slower |
+| `training.softplus_bias` | `training` section | 3.0-10.0 | Controls softplus curvature; 5.0 is default |
 
-### 6.4. Debugging Training Issues
+### 6.4. Feature Engineering
+
+The system supports flexible feature engineering through the `features` section:
+
+- **Dynamic features:**
+  - `inventory_on_hand`: Current on-hand inventory at each node
+  - `outstanding_orders`: In-transit inventory broken down by lead time (shape `[B, N, L]`)
+
+- **Static features:**
+  - `holding_cost`: Per-node holding cost
+  - `underage_cost`: Per-node underage cost
+  - `lead_time`: Maximum incoming lead time for each node
+
+- **Optional features:**
+  - `demand_history`: Past demand values (if `past_periods > 0`)
+  - `time_features`: Time-based features (if not null)
+
+### 6.5. FEL Types
+
+The Feasibility Enforcement Layer type is specified in `model.gnn_params.fel_type`:
+
+- **`g1a`**: Full Allocation Proportional - Ensures transshipment nodes allocate ALL available inventory
+- **`g1b`**: DC-Bid Proportional - (Not fully implemented, falls back to `g1`)
+- **`g1`** (default): Standard Proportional Allocation - Scales down outgoing orders if sum exceeds available inventory
+
+### 6.6. Debugging Training Issues
 
 If loss is not decreasing:
-1. **Reduce `periods`** to simplify the problem
-2. **Lower `learning_rate`** to prevent instability
+1. **Reduce `episode_length.train`** to simplify the problem
+2. **Lower `training.optimizer.lr`** to prevent instability
 3. **Check gradient norms** (should be non-zero but not exploding)
-4. **Verify data generation** (run tests to ensure demands and inventories are reasonable)
+4. **Verify data generation** (check that demands and inventories are reasonable)
 
 If loss diverges (NaN or explodes):
-1. **Reduce `learning_rate`** immediately
-2. **Increase `grad_clip_norm`** for stronger clipping
+1. **Reduce `training.optimizer.lr`** immediately
+2. **Increase `training.gradient_clip_norm`** for stronger clipping
 3. **Check for numerical issues** in cost parameters (very large underage costs can cause instability)
+4. **Reduce `training.softplus_bias`** if softplus is causing issues
 
-## 7. Test Coverage
+## 7. Key Components
 
-The project is rigorously tested with a comprehensive suite that validates:
+### 7.1. Feasibility Enforcement Layer (FEL)
 
-- **Data Generation:** Tensor shapes, value ranges, demand masking
-- **Graph Parsing:** YAML topology parsing, node feature extraction, edge index construction
-- **GNN Model:** Forward pass shapes, edge flow predictions
-- **Simulation Physics:** Feasibility capping, flow aggregation, sales calculation, cost computation
-- **Training Pipeline:** Batch preparation, episode orchestration, loss calculation, gradient flow
+The FEL ensures that all actions respect inventory constraints:
+- Takes raw edge logits from the GNN
+- Applies softplus to make them non-negative
+- Scales down outgoing flows if they exceed available inventory
+- For transshipment nodes (with `fel_type: "g1a"`), ensures full allocation of available inventory
+- Maintains differentiability throughout
 
-**Critical Validation:** The test suite includes a full numerical gradient check using `torch.autograd.gradcheck` (in `tests/training/test_end_to_end.py`) that verifies the end-to-end differentiability of the entire simulation pipeline. This confirms that gradients propagate correctly through:
-- Dynamic feature construction
-- GNN forward pass
-- Multi-period simulation loop
-- Smooth feasibility capping and sales calculations
-- Cost accumulation
+### 7.2. Differentiable Pipeline
 
-All tests pass, confirming the system is mathematically sound and ready for experimentation.
+The pipeline manages in-transit inventory:
+- Tracks orders across multiple lead times using separate queues
+- Each queue is a registered buffer: `[B, N, lead_time]`
+- `get_arrivals()`: Returns inventory arriving at current time step
+- `place_orders()`: Places new orders into appropriate lead-time queues
+- `advance_step()`: Shifts queues forward in time
+- All operations are device-aware and preserve gradients
+
+### 7.3. Cost Function
+
+The cost function includes three components:
+- **Holding cost:** `holding_cost[i] * max(0, inventory[i])` for each node
+- **Underage cost:** `underage_cost[i] * max(0, demand[i] - sales[i])` for each node
+- **Procurement cost:** `procurement_cost[e] * flow[e]` for supplier edges
+
+All costs are computed per time step and accumulated over the episode.
 
 ## 8. Extensibility
 
 ### 8.1. Adding New Graph Topologies
 
-Create a new settings file in `configs/settings/` with your desired node and edge structure. The system supports arbitrary directed graphs.
+Modify the `environment.topology` section in your experiment config. The system supports:
+- Rule-based generation (`generator: "from_rules"`)
+- Custom node counts and edge policies
+- Per-node-type parameter specification
 
 ### 8.2. Modifying Simulation Physics
 
@@ -408,13 +523,20 @@ Edit `src/hdpo_gnn/engine/functional.py::transition_step`. Maintain smooth, diff
 
 ### 8.3. Adding New Cost Terms
 
-Extend the cost calculation in `transition_step` (after inventory updates). Add new parameters to `cost_params` in the settings file and propagate them through the data pipeline.
+Extend the cost calculation in `transition_step` (after inventory updates). Add new parameters to `environment.parameters` in the experiment config and propagate them through the environment builder.
+
+### 8.4. Adding New Features
+
+Extend the feature construction in `simulation_engine.py`:
+1. Add feature name to `features.dynamic` or `features.static` in config
+2. Update `ModelFactory._calculate_node_feature_size()` to account for new feature
+3. Add feature construction logic in `run_simulation_episode()`
 
 ## 9. Known Limitations
 
 - **Deterministic Dynamics:** Lead times and demands are deterministic (no stochasticity in the simulator)
 - **Single-Period Decisions:** The GNN makes decisions at each time step independently (no explicit planning horizon)
-- **Holding Cost Simplification:** All nodes use the same holding cost structure (can be extended to per-node costs)
+- **Fixed Topology:** Graph structure is fixed during training (no dynamic graph changes)
 
 ## 10. References
 
@@ -424,4 +546,4 @@ Extend the cost calculation in `transition_step` (after inventory updates). Add 
 
 ---
 
-**Project Status:** Production-ready. The system is fully implemented, tested, and validated. Ready for research and experimentation on inventory optimization problems with arbitrary graph topologies.
+**Project Status:** Production-ready. The system is fully implemented with FEL, differentiable pipeline, procurement costs, and hyperparameter sweep support. Ready for research and experimentation on inventory optimization problems with arbitrary graph topologies.

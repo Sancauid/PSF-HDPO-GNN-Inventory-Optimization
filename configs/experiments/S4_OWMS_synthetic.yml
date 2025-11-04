@@ -1,0 +1,74 @@
+# 1. METADATA & EXPERIMENT SETUP
+experiment:
+  name: "S4_OWMS_Backlogged_Transshipment_50S_128Scenarios"
+  setting_id: "S4"
+  seed: 42
+  device: "cuda"
+
+# 2. ENVIRONMENT DEFINITION
+environment:
+  topology:
+    generator: "from_rules"
+    rules:
+      node_counts: { warehouse: 1, store: 50 }
+      edge_policy: "warehouse_to_all_stores" # Connects the one WH to all stores
+  demand:
+    source: "synthetic"
+    synthetic_data_config:
+      distribution: "normal"
+      mean_range: [2.5, 7.5]
+      cv_range: [0.25, 0.5]
+      correlation: 0.5
+  parameters:
+    nodes:
+      stores:
+        holding_cost: { sampling_method: "fixed", value: 1.0 }
+        underage_cost: { sampling_method: "fixed", value: 9.0 }
+      warehouses:
+        holding_cost: { sampling_method: "fixed", value: 0.0 } # Transshipment
+    edges:
+      supplier_to_warehouse:
+        lead_time: { sampling_method: "fixed", value: 3 }
+        procurement_cost: { sampling_method: "fixed", value: 0.0 }
+      warehouse_to_store:
+        lead_time: { sampling_method: "fixed", value: 4 }
+  dynamics:
+    unmet_demand_assumption: "backlogged"
+    is_transshipment: true
+    objective: "minimize_cost"
+
+# 3. FEATURE ENGINEERING
+features:
+  dynamic: ["inventory_on_hand", "outstanding_orders"]
+  static: ["holding_cost", "underage_cost", "lead_time"]
+  demand_history: { past_periods: 0 }
+  time_features: null
+
+# 4. DATA HANDLING
+data:
+  split_policy: "random"
+  scenarios: { train: 128, dev: 128, test: 8192 }
+  episode_length: { train: 50, dev: 100, test: 5000 }
+  warmup_periods: { train: 30, dev: 60, test: 3000 }
+  batch_size: 128
+
+# 5. MODEL ARCHITECTURE
+model:
+  architecture_class: "gnn"
+  gnn_params:
+    fel_type: "g1a" # Full Allocation Proportional for transshipment
+    message_passing_layers: 2
+    module_layers: 2
+    module_width: 32
+    weight_sharing: true
+
+# 6. TRAINING PROCESS (HDPO)
+training:
+  optimizer:
+    name: "adam"
+    lr: 0.01
+    betas: [0.9, 0.999]
+  epochs: 100
+  early_stopping_patience: 20
+  softplus_bias: 5.0
+  gradient_clip_norm: 1.0

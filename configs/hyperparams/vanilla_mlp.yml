@@ -1,9 +1,0 @@
-optimizer_params:
-  learning_rate: 0.0003
-model_params:
-  architecture: vanilla
-  layers:
-    - 128
-    - 128
-
-

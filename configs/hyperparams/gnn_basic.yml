@@ -1,9 +1,0 @@
-# configs/hyperparams/gnn_basic.yml
-
-optimizer_params: 
-  learning_rate: 0.00001
-
-model_params: 
-  architecture: 'gnn'
-  hidden_channels: 128
-  num_layers: 2

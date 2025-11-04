@@ -1,0 +1,78 @@
+# FILE: configs/experiments/replication_S4_50S_128Sc.yml
+
+# 1. METADATA & EXPERIMENT SETUP
+experiment:
+  name: "Replication_S4_OWMS_50S_128Sc"
+  setting_id: "S4"
+  seed: 42 # The paper runs multiple seeds; 42 is a good starting point.
+  device: "cuda"
+
+# 2. ENVIRONMENT DEFINITION (Based on Appendix C.13.3)
+environment:
+  topology:
+    generator: "from_rules"
+    rules:
+      node_counts: { warehouse: 1, store: 50 }
+      edge_policy: "warehouse_to_all_stores"
+  demand:
+    source: "synthetic"
+    synthetic_data_config:
+      distribution: "normal"
+      mean_range: [2.5, 7.5]
+      cv_range: [0.25, 0.5]
+      correlation: 0.5
+  parameters:
+    nodes:
+      stores:
+        holding_cost: { sampling_method: "fixed", value: 1.0 }
+        underage_cost: { sampling_method: "fixed", value: 9.0 }
+      warehouses:
+        holding_cost: { sampling_method: "fixed", value: 0.0 }
+    edges:
+      supplier_to_warehouse:
+        lead_time: { sampling_method: "fixed", value: 3 }
+        procurement_cost: { sampling_method: "fixed", value: 0.0 }
+      warehouse_to_store:
+        lead_time: { sampling_method: "fixed", value: 4 }
+  dynamics:
+    unmet_demand_assumption: "backlogged"
+    is_transshipment: true
+    objective: "minimize_cost"
+
+# 3. FEATURE ENGINEERING (Based on general methodology)
+features:
+  # The model should see the static parameters to generalize across nodes
+  dynamic: ["inventory_on_hand", "outstanding_orders"]
+  static: ["holding_cost", "underage_cost", "lead_time"]
+  demand_history: { past_periods: 0 }
+  time_features: null
+
+# 4. DATA HANDLING (Based on Section 4.3 and Appendix C.7)
+data:
+  split_policy: "random"
+  scenarios: { train: 128, dev: 128, test: 8192 }
+  episode_length: { train: 50, dev: 100, test: 5000 }
+  warmup_periods: { train: 20, dev: 60, test: 3000 } # The paper uses final 20/40 periods, so warmup is T - eval_window
+  batch_size: 128 # For small sample sizes, batch size equals n_train_scenarios
+
+# 5. MODEL ARCHITECTURE (Based on Table 6)
+model:
+  architecture_class: "gnn" # Corresponds to PaperGNNPolicy
+  gnn_params:
+    fel_type: "g1a"
+    message_passing_layers: 2 # Default from paper, a good starting point
+    module_layers: 2
+    module_width: 32
+    weight_sharing: true
+
+# 6. TRAINING PROCESS (HDPO) (Based on Appendix C.7 and Table 6)
+training:
+  optimizer:
+    name: "adam"
+    # This is the list for the grid search
+    lr: [0.01, 0.001, 0.0001]
+    betas: [0.9, 0.999]
+  epochs: 20000 # A high number to ensure convergence
+  early_stopping_patience: 500
+  softplus_bias: 5.0
+  gradient_clip_norm: 1.0

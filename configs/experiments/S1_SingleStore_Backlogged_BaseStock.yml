@@ -1,0 +1,49 @@
+# File: experiments/S1_SingleStore_Backlogged_BaseStock.yml
+
+# 1. METADATA & EXPERIMENT SETUP
+experiment: { name: "S1_SingleStore_Backlogged_BaseStock", setting_id: "S1", seed: 42, device: "cuda" }
+
+# 2. ENVIRONMENT DEFINITION (from one_store_backlogged.yml)
+environment:
+  topology:
+    generator: "from_rules"
+    rules: { node_counts: { store: 1 }, edge_policy: "supplier_to_all_stores" }
+  demand:
+    source: "synthetic"
+    synthetic_data_config: { distribution: "normal", mean: 5.0, std: 1.6 }
+  parameters:
+    nodes:
+      stores:
+        holding_cost: { sampling_method: "fixed", value: 1.0 }
+        underage_cost: { sampling_method: "fixed", value: 9.0 }
+    edges:
+      supplier_to_store: { lead_time: { sampling_method: "fixed", value: 4 } }
+  dynamics: { unmet_demand_assumption: "backlogged", objective: "minimize_cost" }
+
+# 3. FEATURE ENGINEERING
+features:
+  dynamic: ["inventory_on_hand", "outstanding_orders"]
+  static: [] # The simple baseline doesn't need static features as input
+
+# 4. DATA HANDLING
+data:
+  split_policy: "random"
+  scenarios: { train: 32768, dev: 32768, test: 32768 }
+  episode_length: { train: 50, dev: 100, test: 5000 }
+  warmup_periods: { train: 30, dev: 60, test: 3000 }
+  batch_size: 8192
+
+# 5. MODEL ARCHITECTURE (from base_stock.yml)
+model:
+  architecture_class: "base_stock" # Your code will instantiate a simple BaseStockPolicy
+  heuristic_params:
+    initial_bias: 10.0 # This becomes the initial guess for the base-stock level
+
+# 6. TRAINING PROCESS (from base_stock.yml)
+training:
+  optimizer:
+    name: "adam" # Adam works for simple policies too
+    lr: 0.5 # A high LR is fine for a single parameter
+  epochs: 20000
+  early_stopping_patience: 500
+  dev_eval_freq_epochs: 10

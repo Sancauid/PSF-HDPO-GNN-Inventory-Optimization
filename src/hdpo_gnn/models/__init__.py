@@ -1,7 +1,5 @@
-from .gnn import GNNPolicy
-from .vanilla import VanillaPolicy
+from .paper_gnn import PaperGNNPolicy
 
 __all__ = [
-    "VanillaPolicy",
-    "GNNPolicy",
+    "PaperGNNPolicy",
 ]
